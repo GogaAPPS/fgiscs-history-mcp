@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""MCP server over the version history of Russian construction-pricing open data.
-
-The source portal (ФГИС ЦС, fgiscs.minstroyrf.ru) publishes only the latest export
-of each dataset. This server serves what the portal does not: the history — what
-changed, when, and what did not change despite being republished.
-
-Data ships with the server as plain JSONL files under data/. No network calls,
-no API key, no account.
-"""
+"""MCP server for FGIS CS public datasets and current price/index lookups."""
 import json
 import os
 import statistics
 from collections import defaultdict
 
 from mcp.server import MCPServer
+from local_index import find_coefficient_references, search_norms as query_norms
+from local_index import search_resources as query_resources
+from local_index import sync_status
+from portal import (
+    PORTAL_BASE,
+    PortalError,
+    get_json,
+    list_open_datasets as fetch_open_datasets,
+    resolve_price_filters,
+    retrieved_at,
+    search_public_indices,
+    search_public_prices,
+)
 
 mcp = MCPServer("fgiscs-history")
 
@@ -159,6 +164,191 @@ async def salary_growth_ranking(limit: int = 10, ascending: bool = False) -> str
     lines.append("")
     lines.append(f"Источник: {SOURCE}.")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def current_data_status() -> str:
+    """Показать локальные выгрузки и их свежесть: дата публикации, загрузки и хеш.
+
+    Снимки создаются командой `python sync_data.py`; этот инструмент ничего не загружает.
+    """
+    return sync_status()
+
+
+@mcp.tool()
+async def current_open_datasets() -> str:
+    """Получить актуальный публичный каталог наборов ФГИС ЦС напрямую с портала."""
+    try:
+        rows = fetch_open_datasets()
+    except PortalError as exc:
+        return str(exc)
+    if not rows:
+        return "Публичный каталог ФГИС ЦС вернул пустой список."
+    lines = [f"Каталог ФГИС ЦС на {retrieved_at()}", f"Источник: {PORTAL_BASE}/opendata", f"Наборов: {len(rows)}", ""]
+    for row in rows:
+        identifier = str(row.get("identificationNumber", "")).strip()
+        lines.append(
+            f"{row.get('datasetName', 'Без названия')} ({identifier}) — "
+            f"обновлён {row.get('lastChangeDate', 'дата не указана')}; "
+            f"карточка: {PORTAL_BASE}/opendata/{identifier}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_construction_resources(query: str, kind: str = "all", limit: int = 10) -> str:
+    """Искать ресурсы по коду или названию в локальном индексе актуальных выгрузок.
+
+    kind: all, materials, machines или labor. Для первого запуска выполните `python sync_data.py`.
+    """
+    try:
+        rows = query_resources(query, kind, limit)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        return str(exc)
+    if not rows:
+        return f"Ресурс {query!r} не найден в текущем локальном индексе.\n{sync_status()}"
+    lines = [f"Ресурсы по запросу {query!r}; источник — актуальные выгрузки ФГИС ЦС:"]
+    for row in rows:
+        lines.append(
+            f"{row['code']} — {row['name']}" + (f"; ед. изм.: {row['unit']}" if row["unit"] else "")
+            + f"; тип: {row['kind']}; набор: {row['source_name']}; источник: {row['source_url']}"
+        )
+    lines.append(sync_status())
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_norms(query: str = "", norm_code: str = "", limit: int = 10) -> str:
+    """Искать нормы ФСНБ по коду, описанию или составу ресурсов.
+
+    Возвращает единицу измерения, технологический состав, ресурсы, базу, редакцию и первоисточник.
+    Локальный индекс ФСНБ-2022 строится командой `python sync_data.py`.
+    """
+    try:
+        rows = query_norms(query, limit, norm_code or None)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        return str(exc)
+    if not rows:
+        return f"Сметная норма не найдена по запросу {query or norm_code!r}.\n{sync_status()}"
+    lines = [f"Найдено норм: {len(rows)}. Состав — по файлу ФСНБ; цены в ответе не рассчитываются."]
+    for row in rows:
+        lines.append(
+            f"\n{row['code']} — {row['name']}\n"
+            f"База: {row['base_type']} / {row['base_name']}; уровень цен: {row['price_level']}; "
+            f"редакция файла: {row['creation_date']}; единица: {row['unit']}\n"
+            f"Состав работ: {'; '.join(row['contents']) or 'не указан'}\n"
+            f"Ресурсы: {json.dumps(row['resources'], ensure_ascii=False)}\n"
+            f"Нормативные ссылки из строки нормы: {json.dumps(row['normative_basis'], ensure_ascii=False)}\n"
+            f"Исходный файл: {row['source_url']}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_current_prices(
+    query: str,
+    subject: str,
+    period: str = "",
+    price_zone: str = "",
+    authority: str = "",
+    kind: str = "materials",
+    limit: int = 10,
+) -> str:
+    """Запросить текущие цены материалов/машин из публичного API ФГИС ЦС.
+
+    Если период не задан, используется самый новый период портала. Если регион имеет
+    несколько ценовых зон, укажите зону; неоднозначные значения будут перечислены.
+    """
+    if not query.strip() or not subject.strip():
+        return "Нужно указать поисковый запрос и субъект РФ."
+    try:
+        filters = resolve_price_filters(subject, period or None, price_zone or None, authority or None)
+        rows = search_public_prices(query, filters, kind, limit)
+    except (PortalError, ValueError, TypeError) as exc:
+        return str(exc)
+    result = {
+        "source": f"{PORTAL_BASE}/prices",
+        "retrieved_at": retrieved_at(),
+        "subject": filters["subject"]["name"],
+        "price_zone": filters["zone"]["name"],
+        "period": filters["period"]["name"],
+        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "kind": kind,
+        "query": query,
+        "items": rows,
+    }
+    if not rows:
+        return "По заданным фильтрам портал не вернул опубликованных цен.\n" + json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_current_indices(
+    query: str,
+    subject: str,
+    period: str = "",
+    price_zone: str = "",
+    authority: str = "",
+    index_type: str = "resource_groups",
+    limit: int = 10,
+) -> str:
+    """Запросить опубликованные индексы из публичных разделов ФГИС ЦС.
+
+    Сейчас поддерживаются индексы к группам однородных строительных ресурсов.
+    Период не указан — будет выбран новейший доступный квартал.
+    """
+    if not query.strip() or not subject.strip():
+        return "Нужно указать поисковый запрос и субъект РФ."
+    try:
+        filters = resolve_price_filters(subject, period or None, price_zone or None, authority or None)
+        rows = search_public_indices(query, filters, index_type, limit)
+    except (PortalError, ValueError, TypeError) as exc:
+        return str(exc)
+    result = {
+        "source": f"{PORTAL_BASE}/prices",
+        "retrieved_at": retrieved_at(),
+        "subject": filters["subject"]["name"],
+        "price_zone": filters["zone"]["name"],
+        "period": filters["period"]["name"],
+        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "index_type": index_type,
+        "query": query,
+        "field_meanings": {
+            "price": "Сметная цена группы в уровне цен на 01.01.2022 без оплаты труда машинистов, руб.",
+            "index": "Индекс изменения сметной стоимости к группе однородных строительных ресурсов.",
+        },
+        "coverage_note": "Это индекс к группе однородных ресурсов; он не заменяет индексы по видам затрат.",
+        "items": rows,
+    }
+    if not rows:
+        return "Публичный API не вернул подходящих строк индексов для этих фильтров.\n" + json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_coefficient_references(query: str = "", norm_code: str = "", limit: int = 10) -> str:
+    """Искать привязанные к норме ссылки на основания в ФСНБ.
+
+    Текущая выгрузка ФСНБ не является каталогом коэффициентов по условиям работ и
+    не содержит для них нормализованных значений. Этот инструмент возвращает только
+    ссылки из полей нормы и явно не выдаёт неподтверждённый коэффициент.
+    """
+    try:
+        rows = find_coefficient_references(query, norm_code or None, limit)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        return str(exc)
+    if not rows:
+        return (
+            "В проиндексированных данных нет подтверждённого справочника коэффициентов "
+            "по условиям работ для этого запроса. Значение нельзя надёжно вывести из одной нормы.\n"
+            "Индексирует актуальный файл ФСНБ; нормативное основание должно быть проверено по документу-первоисточнику.\n"
+            + sync_status()
+        )
+    return (
+        "Найдены только нормативные ссылки, прикреплённые к норме. Они сами по себе не являются "
+        "значениями коэффициентов и не подтверждают условие применения.\n"
+        + json.dumps(rows, ensure_ascii=False, indent=2)
+    )
 
 
 def main():

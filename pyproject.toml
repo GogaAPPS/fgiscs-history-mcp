@@ -6,20 +6,21 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["mcp", "model-context-protocol", "open-data", "russia", "construction", "pricing", "fgiscs", "minstroy"]
-dependencies = ["mcp>=1.0"]
+dependencies = ["mcp>=2.0,<3.0", "truststore>=0.9"]
 
 [project.urls]
 Homepage = "https://github.com/elysosss/fgiscs-history-mcp"
 
 [project.scripts]
 fgiscs-history-mcp = "server:main"
+fgiscs-history-mcp-sync = "sync_data:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["server"]
+py-modules = ["server", "portal", "local_index", "sync_data"]
 include-package-data = true
 
 [tool.setuptools.package-data]
