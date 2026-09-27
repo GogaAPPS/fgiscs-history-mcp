@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fgiscs-history-mcp
+  labels:
+    app.kubernetes.io/name: fgiscs-history-mcp
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fgiscs-history-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fgiscs-history-mcp
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      securityContext:
+        fsGroup: 10001
+      initContainers:
+        - name: sync-open-data
+          image: ghcr.io/gogaapps/fgiscs-history-mcp:bootstrap
+          imagePullPolicy: Always
+          command: ["python", "/app/sync_data.py"]
+          envFrom:
+            - configMapRef:
+                name: fgis-config
+            - secretRef:
+                name: fgis-secrets
+                optional: true
+          volumeMounts:
+            - name: fgis-data
+              mountPath: /app/data/cache
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      containers:
+        - name: fgiscs-history-mcp
+          image: ghcr.io/gogaapps/fgiscs-history-mcp:bootstrap
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: fgis-config
+            - secretRef:
+                name: fgis-secrets
+                optional: true
+          ports:
+            - name: mcp
+              containerPort: 8000
+          volumeMounts:
+            - name: fgis-data
+              mountPath: /app/data/cache
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+          startupProbe:
+            tcpSocket:
+              port: mcp
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: mcp
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: mcp
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+      volumes:
+        - name: fgis-data
+          persistentVolumeClaim:
+            claimName: fgiscs-data
+      terminationGracePeriodSeconds: 30

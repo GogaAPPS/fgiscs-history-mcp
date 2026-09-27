@@ -34,7 +34,7 @@ from portal import (
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-CACHE_DIR = DATA_DIR / "cache"
+CACHE_DIR = Path(os.environ.get("FGISCS_CACHE_DIR", DATA_DIR / "cache")).expanduser()
 DEFAULT_IDS = ("7707082071-ksrms", "7707082071-fsnb", "7707082071-OplataTruda")
 MAX_DATASET_BYTES = 250 * 1024 * 1024
 
@@ -308,7 +308,7 @@ def synchronize(dataset_ids: tuple[str, ...] = DEFAULT_IDS) -> dict[str, Any]:
                 "file_bytes": len(raw),
                 "file_sha256": __import__("hashlib").sha256(raw).hexdigest(),
                 "source_url": source_url,
-                "local_path": str(raw_path.relative_to(ROOT)),
+                "local_path": str(raw_path.relative_to(CACHE_DIR)),
             }
             if dataset_id == "7707082071-ksrms":
                 record["resources_indexed"] = _parse_ksr_csv(raw, db, source_url, display_name)
@@ -355,7 +355,13 @@ def reindex_cached(dataset_ids: tuple[str, ...] | None = None) -> dict[str, Any]
     db = _create_database(db_temp)
     try:
         for record in records:
-            raw_path = ROOT / record["local_path"]
+            stored_path = Path(record["local_path"])
+            raw_path = stored_path if stored_path.is_absolute() else CACHE_DIR / stored_path
+            if not raw_path.exists() and not stored_path.is_absolute():
+                # Read manifests written before local_path became cache-relative.
+                legacy_path = ROOT / stored_path
+                if legacy_path.exists():
+                    raw_path = legacy_path
             raw = raw_path.read_bytes()
             dataset_id = record["identification_number"]
             if dataset_id == "7707082071-ksrms":

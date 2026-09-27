@@ -24,6 +24,8 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+`requirements.txt` перечисляет runtime-зависимости, которые устанавливаются в Docker-образ и CI. При добавлении библиотеки обновляйте его вместе с `pyproject.toml`.
+
 В Windows PowerShell активируйте окружение командой `.\.venv\Scripts\Activate.ps1`, а в Command Prompt — `.venv\Scripts\activate.bat`.
 
 Загрузите актуальные открытые наборы и создайте локальный индекс:
@@ -68,6 +70,20 @@ sqlite3 data/cache/index.sqlite "SELECT code, name, unit, base_type, base_name F
 
 Текущие цены и индексы **не загружаются в эту SQLite**: MCP запрашивает их онлайн у портала. Это значит, что для `search_current_prices` и `search_current_indices` нужен HTTPS-доступ при каждом вызове.
 
+## Локальный запуск в Docker Compose
+
+Подготовьте файл конфигурации и поднимите сервис:
+
+```bash
+cp .env.fgis_config.example .env.fgis_config
+docker compose --env-file .env.fgis_config run --rm fgiscs-history-mcp python sync_data.py
+docker compose --env-file .env.fgis_config up -d --build
+```
+
+Сервис доступен по MCP Streamable HTTP адресу `http://localhost:8000/mcp`. Локальные выгрузки хранятся в Docker volume `fgiscs-history-mcp_fgiscs-data` и переживают пересоздание контейнера. `docker compose down` оставляет volume; `docker compose down -v` удаляет его вместе с базой и исходными файлами. Чтобы обновить снимок, повторно выполните команду `run ... python sync_data.py`.
+
+Переменные приложения задаются в `.env.fgis_config`; пример находится в `.env.fgis_config.example`. `.env.fgis_secrets` подключается опционально. Сейчас учётные данные ФГИС ЦС не нужны, поэтому секретный файл можно не создавать. Оба локальных файла исключены из Git.
+
 ## Подключение MCP-клиента
 
 Пример настройки MCP-клиента:
@@ -84,6 +100,8 @@ sqlite3 data/cache/index.sqlite "SELECT code, name, unit, base_type, base_name F
 ```
 
 Замените `/absolute/path/to/fgiscs-history-mcp` на фактический путь к клону. В Windows укажите путь к `.venv\\Scripts\\python.exe` (в JSON обратные слэши нужно удваивать). После сохранения конфигурации перезапустите или обновите MCP-клиент. Сервер работает через stdio и запускается самим MCP-клиентом.
+
+Локальный запуск выше использует Streamable HTTP; Kubernetes Service доступен внутри кластера по адресу `http://fgiscs-history-mcp.apps.svc.cluster.local:8000/mcp`. Ingress и внешний публичный endpoint намеренно не создаются.
 
 ## Инструменты
 
@@ -117,10 +135,30 @@ sqlite3 data/cache/index.sqlite "SELECT code, name, unit, base_type, base_name F
 ## Проверка
 
 ```bash
-python test_server.py
-python test_data_sync.py
+inv check
 ```
+
+Команда проверяет синтаксис Python и запускает имеющиеся проверки сервера и синхронизации данных. Invoke устанавливается из `requirements.txt`.
 
 Для smoke-проверки выполните `python sync_data.py`, затем вызовите `current_open_datasets`, `search_norms`, `search_current_indices` и `search_current_prices` через MCP-клиент. Для поиска цены укажите поисковую фразу и субъект РФ; при нескольких ценовых зонах укажите зону. Можно ограничить выдачу периодом и отраслевой организацией.
 
 Исторический снимок описан в [`docs/ru/README.md`](docs/ru/README.md).
+
+## CI/CD и Kubernetes
+
+- `.github/workflows/ci.yml` запускает существующие проверки, валидирует Compose/Deployfile/Kubernetes YAML и собирает Docker image без публикации.
+- `.github/workflows/cd.yml` публикует image в GHCR при push в `main` или version tag `v*.*.*`. Деплой запускается вручную из GitHub Actions → `CD`, выбирается `preproduction` или `production`.
+- Kubernetes получает обычные настройки из ConfigMap `fgis-config`. Ссылка на Secret `fgis-secrets` опциональна: секретов ФГИС ЦС сейчас нет. Образы и cache volume описаны в `k8s/`; init container загружает открытые наборы и строит SQLite при каждом rollout.
+- Деплой ожидает K3s/GitHub self-hosted runner с labels `self-hosted`, `linux`, `x64`, `k3s-deploy`, настроенным `KUBECONFIG`, StorageClass `local-path` и image pull secret `ghcr-pull` в выбранном namespace.
+
+GitHub Actions Variables можно задать для конкретного репозитория или GitHub Environment:
+
+```text
+PYTHON_VERSION=3.12
+REGISTRY=ghcr.io
+IMAGE_NAME=fgiscs-history-mcp
+K8S_NAMESPACE=apps
+KUBECONFIG=/home/github-runner/.kube/config
+```
+
+Остальные runtime-параметры описаны в `Deployfile.yml` и `k8s/configmap.yaml`. Если позднее появятся секреты, положите их в env-файл на сервере и синхронизируйте командой `KUBECTL="sudo k3s kubectl" ./scripts/sync-k8s-secrets.sh`; сами значения не следует хранить в репозитории или GitHub Actions Variables.

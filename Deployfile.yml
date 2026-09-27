@@ -1,0 +1,54 @@
+format: 4
+version: 0.2.0
+
+metadata:
+  name: fgiscs-history-mcp
+  system: fgiscs-history-mcp
+  lang: python
+  lang_version: "3.12"
+  deploy_to: k8s
+
+spec:
+  - data:
+      common:
+        image: "ghcr.io/gogaapps/fgiscs-history-mcp"
+
+      deployment:
+        replicas: 1
+        namespace: apps
+        request_cpu: 100
+        limit_mem: 1024
+        port: 8000
+        service_port: 8000
+        config_map: fgis-config
+        secret: fgis-secrets
+
+        env:
+          APP_NAME: fgiscs-history-mcp
+          APP_ENV: "{{ values.environment }}"
+          LOG_LEVEL: INFO
+          FGISCS_API_BASE: https://fgiscs.minstroyrf.ru/api/
+          FGISCS_TIMEOUT: "20"
+          FGISCS_CACHE_DIR: /app/data/cache
+          FGISCS_MCP_TRANSPORT: streamable-http
+          FGISCS_MCP_HOST: 0.0.0.0
+          FGISCS_MCP_PORT: "8000"
+          FGISCS_MCP_PATH: /mcp
+
+  - subject:
+      environment: ["preproduction"]
+    data:
+      deployment:
+        replicas: 1
+        env:
+          APP_ENV: preproduction
+          LOG_LEVEL: DEBUG
+
+  - subject:
+      environment: ["production"]
+    data:
+      deployment:
+        replicas: 1
+        env:
+          APP_ENV: production
+          LOG_LEVEL: INFO

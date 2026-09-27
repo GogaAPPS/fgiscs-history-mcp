@@ -20,7 +20,7 @@ from portal import (
     search_public_prices,
 )
 
-mcp = MCPServer("fgiscs-history")
+mcp = MCPServer("fgiscs-history", log_level=os.environ.get("LOG_LEVEL", "INFO").upper())
 
 DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 SOURCE = "ФГИС ЦС (fgiscs.minstroyrf.ru), открытые данные Минстроя России"
@@ -353,7 +353,19 @@ async def search_coefficient_references(query: str = "", norm_code: str = "", li
 
 def main():
     """Entry point for the `fgiscs-history-mcp` console script."""
-    mcp.run(transport="stdio")
+    transport = os.environ.get("FGISCS_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+        return
+    if transport == "streamable-http":
+        mcp.run(
+            transport="streamable-http",
+            host=os.environ.get("FGISCS_MCP_HOST", "0.0.0.0"),
+            port=int(os.environ.get("FGISCS_MCP_PORT", "8000")),
+            streamable_http_path=os.environ.get("FGISCS_MCP_PATH", "/mcp"),
+        )
+        return
+    raise ValueError("FGISCS_MCP_TRANSPORT должен быть stdio или streamable-http.")
 
 
 if __name__ == "__main__":
