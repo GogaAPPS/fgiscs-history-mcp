@@ -12,13 +12,11 @@ import io
 import json
 import os
 import re
-import shutil
 import sqlite3
 import sys
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 

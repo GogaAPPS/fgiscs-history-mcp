@@ -1,7 +1,6 @@
 """Tests for local snapshot parsing and the read-only public API helpers."""
 import io
 import json
-import sqlite3
 import tempfile
 import unittest
 import zipfile

@@ -12,7 +12,6 @@ from local_index import sync_status
 from portal import (
     PORTAL_BASE,
     PortalError,
-    get_json,
     list_open_datasets as fetch_open_datasets,
     resolve_price_filters,
     retrieved_at,
