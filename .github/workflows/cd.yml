@@ -82,12 +82,35 @@ jobs:
           TARGET_ENVIRONMENT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'production' }}
         run: |
           set -Eeuo pipefail
+
+          sanitize_tag() {
+            local value="$1"
+            local max_length="${2:-128}"
+            value="${value//\//-}"
+            value="$(printf '%s' "$value" | tr -c 'A-Za-z0-9_.-' '-')"
+            value="$(printf '%s' "$value" | sed -E 's/-+/-/g; s/^[.-]+//; s/[.-]+$//')"
+            value="${value:0:$max_length}"
+            value="$(printf '%s' "$value" | sed -E 's/[.-]+$//')"
+
+            if [ -z "$value" ]; then
+              echo "Docker image tag is empty after sanitization" >&2
+              exit 1
+            fi
+
+            printf '%s' "$value"
+          }
+
           OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
           COMMIT_SHA="$(git rev-parse HEAD)"
           SHORT_SHA="${COMMIT_SHA::7}"
-          TAG="${IMAGE_TAG_OVERRIDE:-${REF_NAME//\//-}-${SHORT_SHA}}"
-          TAG="$(printf '%s' "$TAG" | tr -c 'A-Za-z0-9_.-' '-')"
+          if [ -n "$IMAGE_TAG_OVERRIDE" ]; then
+            TAG="$(sanitize_tag "$IMAGE_TAG_OVERRIDE")"
+          else
+            MAX_REF_LENGTH=$((128 - 1 - ${#SHORT_SHA}))
+            SANITIZED_REF="$(sanitize_tag "$REF_NAME" "$MAX_REF_LENGTH")"
+            TAG="$(sanitize_tag "${SANITIZED_REF}-${SHORT_SHA}")"
+          fi
           IMAGE_REF="${IMAGE}:${TAG}"
           SHA_TAG="${IMAGE}:sha-${COMMIT_SHA}"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
