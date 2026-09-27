@@ -1,93 +1,165 @@
 # fgiscs-history-mcp
 
-MCP server over the **version history** of Russian construction-pricing open data
-(ФГИС ЦС — the Federal State Information System for Construction Pricing, operated by
-Glavgosekspertiza of Russia under Government Decree № 1452 of 23.12.2016).
+MCP-сервер для открытых данных ФГИС ЦС. Сочетает историю выгрузок, локальный индекс актуальных КСР/ФСНБ и read-only запросы текущих цен и индексов к публичному API портала.
 
-The source portal publishes only the **latest** export of each dataset. This server
-serves what the portal does not: what changed, when — and what did **not** change
-despite being republished.
+## Что нужно
 
-History covers **198 versions of 15 datasets, from 2017 to 2026**.
+- Python 3.10 или новее.
+- Исходящий HTTPS-доступ к `fgiscs.minstroyrf.ru` для первой загрузки, обновления локальных выгрузок и онлайн-поиска цен/индексов.
+- MCP-клиент, который умеет запускать сервер по stdio (например, Codex или Claude Desktop).
+- Место на диске для файловых выгрузок и SQLite-индекса в `data/cache/`. Размер зависит от текущих архивов портала.
 
-## Why this exists
+Ключ и аккаунт ФГИС ЦС для перечисленных публичных запросов не требуются.
 
-Open data portals are built for downloading, not for comparing. If you want to know how
-a value moved over six years, you have to find every past export, unpack it, repair it
-and stitch it together. That work is done here once, so it does not have to be done again.
+## Установка и первая загрузка данных
 
-A concrete example the server can answer and the portal cannot: two exports of the
-construction resources classifier — `2018-11-22` and `2019-06-17` — are **byte-identical**.
-The portal published an update in which nothing had changed. A user of the portal sees
-only the publication date and concludes, wrongly, that the data moved.
-
-## Install
-
-Requires Python 3.10+.
+Склонируйте репозиторий, перейдите в его папку, создайте виртуальное окружение и установите MCP-сервер вместе с зависимостями:
 
 ```bash
-git clone https://github.com/elysosss/fgiscs-history-mcp
+git clone <URL-репозитория>
 cd fgiscs-history-mcp
-pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-Add to your MCP client config (Claude Desktop, Claude Code, Cursor, …):
+`requirements.txt` перечисляет runtime-зависимости, которые устанавливаются в Docker-образ и CI. При добавлении библиотеки обновляйте его вместе с `pyproject.toml`.
+
+В Windows PowerShell активируйте окружение командой `.\.venv\Scripts\Activate.ps1`, а в Command Prompt — `.venv\Scripts\activate.bat`.
+
+Загрузите актуальные открытые наборы и создайте локальный индекс:
+
+```bash
+python sync_data.py
+```
+
+По умолчанию синхронизатор получает КСР, ФСНБ и выгрузку оплаты труда. Для поиска в SQLite он разбирает КСР и ФСНБ; исторические инструменты оплаты труда используют архивные данные, включённые в репозиторий. Сырые файлы, каталог выгрузок, даты получения и SHA-256 сохраняются в `data/cache/`.
+
+Можно указать наборы явно:
+
+```bash
+python sync_data.py --ids 7707082071-ksrms 7707082071-fsnb
+```
+
+Чтобы пересобрать SQLite из уже загруженных файлов, не обращаясь к порталу, выполните:
+
+```bash
+python sync_data.py --reindex
+```
+
+Повторный запуск `python sync_data.py` загружает актуальные публикации и заменяет индекс атомарно. Для автоматического обновления запускайте команду по расписанию внешним планировщиком. Загрузка использует публичные GET-запросы и ограничивает размер одного файла 250 МБ. `FGISCS_API_BASE` и `FGISCS_TIMEOUT` можно задать для локальных проверок и настройки таймаута.
+
+## Где лежит SQLite и как посмотреть данные
+
+После синхронизации основная база находится в `data/cache/index.sqlite`:
+
+- `resources` — ресурсы КСР: код, название, единица измерения, тип и источник.
+- `norms` — нормы ФСНБ: код, название, единица, база и редакция, состав работ, нормативные ссылки и источник.
+- `norm_resources` — ресурсы, входящие в норму, с количеством и единицей измерения.
+- Таблицы `*_fts` — полнотекстовые индексы для поисковых MCP-инструментов.
+
+Рядом находятся `manifest.json` с датами и контрольными суммами источников, `catalog.json` и скачанные оригиналы в `files/`. SQLite создаётся и обновляется синхронизатором; MCP открывает её только для чтения. Не редактируйте базу вручную — при следующей синхронизации она будет перестроена.
+
+Если установлен консольный клиент SQLite, выполнить запрос можно так:
+
+```bash
+sqlite3 data/cache/index.sqlite "SELECT code, name, unit, kind FROM resources LIMIT 10;"
+sqlite3 data/cache/index.sqlite "SELECT code, name, unit, base_type, base_name FROM norms LIMIT 10;"
+```
+
+Текущие цены и индексы **не загружаются в эту SQLite**: MCP запрашивает их онлайн у портала. Это значит, что для `search_current_prices` и `search_current_indices` нужен HTTPS-доступ при каждом вызове.
+
+## Локальный запуск в Docker Compose
+
+Подготовьте файл конфигурации и поднимите сервис:
+
+```bash
+cp .env.fgis_config.example .env.fgis_config
+docker compose --env-file .env.fgis_config run --rm fgiscs-history-mcp python sync_data.py
+docker compose --env-file .env.fgis_config up -d --build
+```
+
+Сервис доступен по MCP Streamable HTTP адресу `http://localhost:8000/mcp`. Локальные выгрузки хранятся в Docker volume `fgiscs-history-mcp_fgiscs-data` и переживают пересоздание контейнера. `docker compose down` оставляет volume; `docker compose down -v` удаляет его вместе с базой и исходными файлами. Чтобы обновить снимок, повторно выполните команду `run ... python sync_data.py`.
+
+Переменные приложения задаются в `.env.fgis_config`; пример находится в `.env.fgis_config.example`. `.env.fgis_secrets` подключается опционально. Сейчас учётные данные ФГИС ЦС не нужны, поэтому секретный файл можно не создавать. Оба локальных файла исключены из Git.
+
+## Подключение MCP-клиента
+
+Пример настройки MCP-клиента:
 
 ```json
 {
   "mcpServers": {
-    "fgiscs-history": {
-      "command": "python",
+    "fgiscs": {
+      "command": "/absolute/path/to/fgiscs-history-mcp/.venv/bin/python",
       "args": ["/absolute/path/to/fgiscs-history-mcp/server.py"]
     }
   }
 }
 ```
 
-No API key, no account, no network calls — the data ships with the server (240 KB).
+Замените `/absolute/path/to/fgiscs-history-mcp` на фактический путь к клону. В Windows укажите путь к `.venv\\Scripts\\python.exe` (в JSON обратные слэши нужно удваивать). После сохранения конфигурации перезапустите или обновите MCP-клиент. Сервер работает через stdio и запускается самим MCP-клиентом.
 
-## Tools
+Локальный запуск выше использует Streamable HTTP; Kubernetes Service доступен внутри кластера по адресу `http://fgiscs-history-mcp.apps.svc.cluster.local:8000/mcp`. Ingress и внешний публичный endpoint намеренно не создаются.
 
-| Tool | What it answers |
+## Инструменты
+
+| Инструмент | Данные |
 |---|---|
-| `list_datasets` | Which datasets exist and how deep the history goes for each |
-| `dataset_versions` | Every version of one dataset, flagging schema changes and republished-but-unchanged exports |
-| `salary_history` | Monthly wage rate for a grade-1 construction worker in a given region, 2020 → 2026 |
-| `salary_growth_ranking` | Regions ranked by wage growth over the full period |
+| `list_datasets` | Исторические снимки и даты из включённых в репозиторий метаданных |
+| `dataset_versions` | История публикаций, смены схем и дубликаты |
+| `salary_history`, `salary_growth_ranking` | Исторические ряды оплаты труда |
+| `current_data_status` | Свежесть локальных выгрузок, даты, хеши и источники |
+| `current_open_datasets` | Живой каталог открытых наборов портала |
+| `search_construction_resources` | Поиск по коду/названию КСР и ресурсам, извлечённым из ФСНБ |
+| `search_norms` | Поиск по коду, названию, составу работ и ресурсам в XML ФСНБ-2022 |
+| `search_current_prices` | Онлайн-поиск опубликованных цен материалов или машин с фильтрами субъекта, зоны, квартала и организации |
+| `search_current_indices` | Онлайн-поиск индексов к группам однородных строительных ресурсов |
+| `search_coefficient_references` | Только нормативные ссылки, указанные в строке нормы; инструмент не выдумывает коэффициенты |
 
-Example questions your assistant can now answer:
+Обычно сначала проверьте `current_data_status`, затем используйте `search_norms` или `search_construction_resources`. Для живой цены вызовите `search_current_prices`, указав поисковую фразу и субъект РФ. Если субъекту соответствует несколько ценовых зон, MCP попросит выбрать зону; период и организацию можно задать дополнительно. Для индексов используйте `search_current_indices`.
 
-- «Как менялась ставка рабочего 1 разряда в Иркутской области с 2020 года?»
-  → +202.5 % (41 621 → 125 911 ₽), with the value for each of the 8 published versions.
-- «В каких регионах оплата труда росла медленнее всего?»
-  → Ненецкий АО +44.7 %, Республика Коми +51.1 %, median across 74 regions +88.9 %.
-- «Сколько раз менялась схема Классификатора строительных ресурсов?»
-  → once, on 2022-11-17, across 41 versions.
+Ценовая форма использует опубликованные порталом справочники субъектов, зон, периодов и организаций. `search_current_prices` разрешает эти фильтры, ищет ресурс и получает строки таблиц через публичные endpoint-ы `/EstimatedPrice/BuildingResources/Search/Materials` и `/EstimatedPrice/BuildingResources/Search/Machines`, используемые страницей цен. Проверенный запрос к таблице не требует авторизации. Ответ содержит цену, единицу измерения и код ресурса; MCP также возвращает выбранные фильтры, время получения и ссылку на страницу-источник. При ошибке HTTP или изменении схемы API инструмент сообщает об ошибке, а не выдаёт её за пустой результат. Индексы к группам ресурсов доступны через публичные методы дерева портала.
 
-## Data
+## Покрытие и ограничения
 
-| File | Contents |
-|---|---|
-| `data/datasets.json` | 15 datasets: version count, period covered, schema count, export size |
-| `data/versions.jsonl` | 198 versions: date, schema date, size, sha256, duplicate flag, source URL |
-| `data/oplata-truda.jsonl` | 662 rows — wage series by region across 8 versions |
+- Актуальный открытый каталог содержит КСР, ФСНБ-2020/2022, СПСРП, ценовые зоны, оплату труда и отраслевые наборы. Синхронизатор по умолчанию индексирует КСР и ФСНБ-2022; зарплатные исторические инструменты остаются на прежнем снимке.
+- ФСНБ-2022 содержит отдельные XML-базы ГЭСН, ГЭСНм, ГЭСНмр, ГЭСНп, ГЭСНр, федеральные сметные цены материалов и машин. В индексе сохраняются код, единица, редакция, состав работ, ресурсы и ссылка на исходный архив.
+- Отдельных наборов ТЕР и ЕНиР в текущем открытом каталоге нет. MCP не утверждает, что они включены в ФСНБ.
+- В выгрузке ФСНБ нет отдельного проверенного каталога коэффициентов «условие → значение → применимость». Инструмент коэффициентов возвращает только привязанные к норме ссылки, если они есть. Значение коэффициента без соответствующего документа-первоисточника не выдаётся.
+- Исторические `datasets.json`, `versions.jsonl` и `oplata-truda.jsonl` по-прежнему являются встроенным архивным снимком; текущий каталог и новые сырые файлы находятся в локальном кэше после синхронизации.
 
-Every value carries its source: each version record links back to the original file on
-`fgiscs.minstroyrf.ru`. Nothing here is scraped — the portal's open-data API is public
-and anonymous, and the ingestion pipeline respects it with pauses and backoff.
+Открытые данные ФГИС ЦС требуют сохранять ссылку на первоисточник и не искажать содержимое и дату обновления. Перед передачей данных внешней модели проверьте применимость условий использования данных к вашей схеме обработки.
 
-### Known caveats
+## Проверки и форматирование
 
-- Region names in the source exports contain latin look-alike letters inside Russian
-  words (`Республика Caxa`, `Чукотский автономный oКруг`), inconsistent spellings across
-  versions, and renames. Series are therefore keyed by **region code**, not by name.
-- Price-zone slicing changes between versions (91 zone rows in 2020, 117 in 2026), so the
-  per-region figure is a **median across that region's zones**; min and max are kept.
-- 11 of 85 regions lack a start-to-end series: most appeared in the data after 2020.
+```bash
+inv check
+inv format
+```
 
-## Licence
+`inv check` запускает Ruff, проверку синтаксиса Python и существующие проверки сервера и синхронизации. `inv format` форматирует Python-файлы и применяет безопасные исправления Ruff. Для запуска активируйте виртуальное окружение (`source .venv/bin/activate` в macOS/Linux или `.venv\Scripts\Activate.ps1` в PowerShell) либо вызывайте `.venv/bin/inv` напрямую в macOS/Linux. Invoke и Ruff устанавливаются из `requirements.txt` и `pyproject.toml`.
 
-MIT. The code is free to copy. The data is public open data, and its history is what
-took the work.
+Для smoke-проверки выполните `python sync_data.py`, затем вызовите `current_open_datasets`, `search_norms`, `search_current_indices` и `search_current_prices` через MCP-клиент. Для поиска цены укажите поисковую фразу и субъект РФ; при нескольких ценовых зонах укажите зону. Можно ограничить выдачу периодом и отраслевой организацией.
 
-Russian: [`docs/ru/README.md`](docs/ru/README.md)
+Исторический снимок описан в [`docs/ru/README.md`](docs/ru/README.md).
+
+## CI/CD и Kubernetes
+
+- `.github/workflows/ci.yml` запускает существующие проверки, валидирует Compose/Deployfile/Kubernetes YAML и собирает Docker image без публикации.
+- `.github/workflows/cd.yml` публикует image в GHCR при push в `main` или version tag `v*.*.*`. Чтобы собрать и развернуть другую ветку, запустите `CD` вручную в GitHub Actions и укажите её в поле `branch`; выберите `preproduction` или `production`.
+- Kubernetes получает обычные настройки из ConfigMap `fgis-config`. Ссылка на Secret `fgis-secrets` опциональна: секретов ФГИС ЦС сейчас нет. Образы и cache volume описаны в `k8s/`; init container загружает открытые наборы и строит SQLite при каждом rollout.
+- Деплой ожидает K3s/GitHub self-hosted runner с labels `self-hosted`, `linux`, `x64`, `k3s-deploy`, настроенным `KUBECONFIG`, StorageClass `local-path` и image pull secret `ghcr-pull` в выбранном namespace.
+
+GitHub Actions Variables можно задать для конкретного репозитория или GitHub Environment:
+
+```text
+PYTHON_VERSION=3.12
+REGISTRY=ghcr.io
+IMAGE_NAME=fgiscs-history-mcp
+K8S_NAMESPACE=apps
+KUBECONFIG=/home/github-runner/.kube/config
+```
+
+Остальные runtime-параметры описаны в `Deployfile.yml` и `k8s/configmap.yaml`. Если позднее появятся секреты, положите их в env-файл на сервере и синхронизируйте командой `KUBECTL="sudo k3s kubectl" ./scripts/sync-k8s-secrets.sh`; сами значения не следует хранить в репозитории или GitHub Actions Variables.

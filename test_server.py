@@ -8,8 +8,10 @@ about "nothing changed" is backed by identical checksums, that an unknown input
 gets a helpful answer instead of a crash, and that every answer names its source.
 """
 import asyncio
+import json
 import re
 import unittest
+from unittest.mock import patch
 
 import server
 
@@ -90,6 +92,38 @@ class ToolTest(unittest.TestCase):
         out = call(server.salary_history, subject="Атлантида")
         self.assertIn("не найден", out)
         self.assertNotIn("Traceback", out)
+
+    def test_search_current_prices_returns_rows_and_filter_metadata(self):
+        filters = {
+            "subject": {"id": 1, "name": "Новосибирская область"},
+            "zone": {"id": 2, "name": "1 зона"},
+            "period": {"id": 3, "name": "2 квартал 2026"},
+            "authority": {"id": 4, "name": "Минстрой"},
+        }
+        row = {"code": "01.7.03.01-0002", "name": "Вода водопроводная", "unitName": "м3", "aggregatedPrice": "32.96"}
+        for kind in ("materials", "machines"):
+            with self.subTest(kind=kind):
+                with patch.object(server, "resolve_price_filters", return_value=filters), patch.object(
+                    server, "search_public_prices", return_value=[row]
+                ) as search:
+                    output = call(
+                        server.search_current_prices,
+                        query="вода" if kind == "materials" else "экскаватор",
+                        subject="Новосибирская область",
+                        period="2 квартал 2026",
+                        price_zone="1 зона",
+                        authority="Минстрой",
+                        kind=kind,
+                    )
+                result = json.loads(output)
+                self.assertEqual(result["items"], [row])
+                self.assertEqual(result["kind"], kind)
+                self.assertEqual(result["subject"], "Новосибирская область")
+                self.assertEqual(result["price_zone"], "1 зона")
+                self.assertEqual(result["period"], "2 квартал 2026")
+                self.assertTrue(result["source"].endswith("/prices"))
+                self.assertTrue(result["retrieved_at"])
+                self.assertEqual(search.call_args.args[2], kind)
 
     def test_ranking_respects_limit_and_direction(self):
         top = call(server.salary_growth_ranking, limit=3)

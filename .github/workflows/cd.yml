@@ -1,0 +1,170 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch or tag to build and deploy
+        type: string
+        required: true
+        default: main
+      environment:
+        description: Target GitHub/Kubernetes environment
+        type: choice
+        required: true
+        default: preproduction
+        options: [preproduction, production]
+      image_tag:
+        description: Optional image tag override
+        type: string
+        required: false
+
+env:
+  PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.12' }}
+  REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'fgiscs-history-mcp' }}
+  BUILD_CONTEXT: ${{ vars.BUILD_CONTEXT || '.' }}
+  DOCKERFILE_PATH: ${{ vars.DOCKERFILE_PATH || 'Dockerfile' }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'apps' }}
+  KUBECONFIG: ${{ vars.KUBECONFIG || '/home/github-runner/.kube/config' }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  quality:
+    name: Quality checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies and run checks
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          inv check
+
+  build:
+    name: Build and publish image
+    runs-on: ubuntu-latest
+    needs: [quality]
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      image_ref: ${{ steps.image.outputs.image_ref }}
+      sha_tag: ${{ steps.image.outputs.sha_tag }}
+      app_env: ${{ steps.image.outputs.app_env }}
+      ref_name: ${{ steps.image.outputs.ref_name }}
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+
+      - name: Prepare image tag
+        id: image
+        env:
+          REF_NAME: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+          IMAGE_TAG_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image_tag || '' }}
+          TARGET_ENVIRONMENT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'production' }}
+        run: |
+          set -Eeuo pipefail
+
+          sanitize_tag() {
+            local value="$1"
+            local max_length="${2:-128}"
+            value="${value//\//-}"
+            value="$(printf '%s' "$value" | tr -c 'A-Za-z0-9_.-' '-')"
+            value="$(printf '%s' "$value" | sed -E 's/-+/-/g; s/^[.-]+//; s/[.-]+$//')"
+            value="${value:0:$max_length}"
+            value="$(printf '%s' "$value" | sed -E 's/[.-]+$//')"
+
+            if [ -z "$value" ]; then
+              echo "Docker image tag is empty after sanitization" >&2
+              exit 1
+            fi
+
+            printf '%s' "$value"
+          }
+
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="${COMMIT_SHA::7}"
+          if [ -n "$IMAGE_TAG_OVERRIDE" ]; then
+            TAG="$(sanitize_tag "$IMAGE_TAG_OVERRIDE")"
+          else
+            MAX_REF_LENGTH=$((128 - 1 - ${#SHORT_SHA}))
+            SANITIZED_REF="$(sanitize_tag "$REF_NAME" "$MAX_REF_LENGTH")"
+            TAG="$(sanitize_tag "${SANITIZED_REF}-${SHORT_SHA}")"
+          fi
+          IMAGE_REF="${IMAGE}:${TAG}"
+          SHA_TAG="${IMAGE}:sha-${COMMIT_SHA}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+          echo "app_env=${TARGET_ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "ref_name=${REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: true
+          tags: |
+            ${{ steps.image.outputs.image_ref }}
+            ${{ steps.image.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to K3s
+    runs-on: [self-hosted, linux, x64, k3s-deploy]
+    needs: [build]
+    if: github.event_name == 'workflow_dispatch'
+    environment: ${{ github.event.inputs.environment }}
+    concurrency:
+      group: k3s-${{ github.event.inputs.environment }}-${{ vars.K8S_NAMESPACE || 'apps' }}-fgiscs-history-mcp
+      cancel-in-progress: false
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.ref_name }}
+
+      - name: Bootstrap or update deployment
+        env:
+          IMAGE: ${{ needs.build.outputs.image_ref }}
+          APP_ENV: ${{ needs.build.outputs.app_env }}
+        run: scripts/bootstrap-k8s.sh
+
+      - name: Deployment summary
+        run: |
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Image: ${{ needs.build.outputs.image_ref }}"
+          echo "Namespace: $K8S_NAMESPACE"
+          echo "MCP endpoint: fgiscs-history-mcp.${K8S_NAMESPACE}.svc.cluster.local:8000/mcp"

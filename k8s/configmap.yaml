@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fgis-config
+  labels:
+    app.kubernetes.io/name: fgiscs-history-mcp
+data:
+  APP_NAME: fgiscs-history-mcp
+  APP_ENV: production
+  LOG_LEVEL: INFO
+  FGISCS_API_BASE: https://fgiscs.minstroyrf.ru/api/
+  FGISCS_TIMEOUT: "20"
+  FGISCS_CACHE_DIR: /app/data/cache
+  FGISCS_MCP_TRANSPORT: streamable-http
+  FGISCS_MCP_HOST: 0.0.0.0
+  FGISCS_MCP_PORT: "8000"
+  FGISCS_MCP_PATH: /mcp

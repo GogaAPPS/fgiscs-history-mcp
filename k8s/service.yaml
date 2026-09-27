@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fgiscs-history-mcp
+  labels:
+    app.kubernetes.io/name: fgiscs-history-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fgiscs-history-mcp
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp

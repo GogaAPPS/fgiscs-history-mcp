@@ -1,0 +1,16 @@
+services:
+  fgiscs-history-mcp:
+    build: .
+    image: fgiscs-history-mcp:local
+    env_file:
+      - .env.fgis_config
+      - path: .env.fgis_secrets
+        required: false
+    ports:
+      - "127.0.0.1:${FGISCS_MCP_PUBLISHED_PORT:-8000}:8000"
+    volumes:
+      - fgiscs-data:/app/data/cache
+    restart: unless-stopped
+
+volumes:
+  fgiscs-data:
