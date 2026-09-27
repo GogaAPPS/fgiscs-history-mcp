@@ -148,7 +148,7 @@ inv format
 ## CI/CD и Kubernetes
 
 - `.github/workflows/ci.yml` запускает существующие проверки, валидирует Compose/Deployfile/Kubernetes YAML и собирает Docker image без публикации.
-- `.github/workflows/cd.yml` запускает проверки и публикует image в GHCR при push в любую ветку или version tag `v*.*.*`. Деплой выбранной ветки запускается вручную из GitHub Actions → `CD`, выбирается `preproduction` или `production`.
+- `.github/workflows/cd.yml` публикует image в GHCR при push в `main` или version tag `v*.*.*`. Чтобы собрать и развернуть другую ветку, запустите `CD` вручную в GitHub Actions и укажите её в поле `branch`; выберите `preproduction` или `production`.
 - Kubernetes получает обычные настройки из ConfigMap `fgis-config`. Ссылка на Secret `fgis-secrets` опциональна: секретов ФГИС ЦС сейчас нет. Образы и cache volume описаны в `k8s/`; init container загружает открытые наборы и строит SQLite при каждом rollout.
 - Деплой ожидает K3s/GitHub self-hosted runner с labels `self-hosted`, `linux`, `x64`, `k3s-deploy`, настроенным `KUBECONFIG`, StorageClass `local-path` и image pull secret `ghcr-pull` в выбранном namespace.
 
