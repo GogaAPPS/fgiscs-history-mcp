@@ -1,6 +1,7 @@
 """Tests for local snapshot parsing and the read-only public API helpers."""
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 import zipfile
@@ -13,6 +14,11 @@ import sync_data
 
 
 class SnapshotParserTest(unittest.TestCase):
+    def test_legacy_zip_filename_is_decoded_from_cp866(self):
+        original = "ФСБЦ_Мат&Оборуд.xml"
+        legacy_name = original.encode("cp866").decode("cp437")
+        self.assertEqual(sync_data._zip_filename(zipfile.ZipInfo(legacy_name)), original)
+
     def test_ksr_cp1251_csv(self):
         raw = (
             "Код ОКПД2,Код КСР,Наименование,Единица измерения,\r\n"
@@ -59,6 +65,34 @@ class SnapshotParserTest(unittest.TestCase):
         self.assertIn("Пр/812-001.1", found[4])
         self.assertIn("Средний разряд", resource[0])
 
+    def test_fsnb_zip_indexes_material_and_machine_price_components(self):
+        material_xml = '''<ResourceCatalog><Decrees>
+          <ApprovingActNumber>527/пр</ApprovingActNumber><ApprovingActDate>14.08.2026</ApprovingActDate>
+        </Decrees><ResourcesDirectory>
+          <Resource Code="01.1.01.01-0002" Name="Деталь фасонная" MeasureUnit="100 компл">
+            <Prices><Price Cost="35537.67" OptCost="34458.33"/></Prices>
+          </Resource></ResourcesDirectory></ResourceCatalog>'''.encode()
+        machine_xml = '''<base CreationDate="14.08.2026" PriceLevel="01.01.2022">
+          <Resource Code="91.01.01-014" Name="Бульдозер" MeasureUnit="маш.-ч">
+            <Prices><Price SalaryMach="386.65" LabourMach="1.00" PriceCostWithoutSalary="961.73" WithRelocation="true"/></Prices>
+            <ExpendableMaterials><Material Electricity="0" ElectricityCost="0"/></ExpendableMaterials>
+          </Resource>
+        </base>'''.encode()
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("ФСБЦ_Мат&Оборуд.xml", material_xml)
+            archive.writestr("ФСБЦ_Маш.xml", machine_xml)
+        with tempfile.TemporaryDirectory() as tmp:
+            db = sync_data._create_database(Path(tmp) / "index.sqlite")
+            sync_data._parse_fsnb_zip(buffer.getvalue(), db, "https://example.test/fsnb", "fsnb.zip")
+            rows = db.execute("SELECT code,kind,unit,edition,price_level,components FROM base_prices ORDER BY code").fetchall()
+            db.close()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][:5], ("01.1.01.01-0002", "materials", "100 компл", "14.08.2026", ""))
+        self.assertEqual(json.loads(rows[0][5])["prices"][0]["Cost"], "35537.67")
+        self.assertEqual(rows[1][1], "machines")
+        self.assertEqual(json.loads(rows[1][5])["prices"][0]["PriceCostWithoutSalary"], "961.73")
+
 
 class LocalIndexTest(unittest.TestCase):
     def setUp(self):
@@ -98,6 +132,29 @@ class LocalIndexTest(unittest.TestCase):
         rows = local_index.search_resources("бульдоз", "machines")
         self.assertEqual(rows[0]["code"], "91.01.01-014")
         self.assertEqual(rows[0]["source_url"], "https://source.test")
+
+    def test_base_price_search_returns_raw_components_and_source(self):
+        db = sqlite3.connect(local_index.INDEX_PATH)
+        db.execute(
+            "INSERT INTO base_prices(code,name,unit,kind,source_file,edition,price_level,components,source_url,source_name) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("01.1.01-0001", "Цемент строительный", "т", "materials", "ФСБЦ_Мат&Оборуд.xml", "14.08.2026", "01.01.2022", json.dumps({"prices":[{"Cost":"150.25","OptCost":"140.00"}]}), "https://source.test/fsnb", "fsnb.zip"),
+        )
+        row_id = db.execute("SELECT id FROM base_prices").fetchone()[0]
+        db.execute("INSERT INTO base_prices_fts(rowid,code,name) VALUES(?,?,?)", (row_id,"01.1.01-0001","Цемент строительный"))
+        db.commit()
+        db.close()
+        rows = local_index.search_base_prices("цемент")
+        self.assertEqual(rows[0]["unit"], "т")
+        self.assertEqual(rows[0]["components"]["prices"][0]["Cost"], "150.25")
+        self.assertEqual(rows[0]["source_url"], "https://source.test/fsnb")
+
+    def test_base_price_search_explains_how_to_update_an_old_index(self):
+        with sqlite3.connect(local_index.INDEX_PATH) as db:
+            db.execute("DROP TABLE base_prices_fts")
+            db.execute("DROP TABLE base_prices")
+        with self.assertRaisesRegex(ValueError, "python sync_data.py --reindex"):
+            local_index.search_base_prices("цемент")
 
     def test_norm_search_returns_structured_composition(self):
         rows = local_index.search_norms("грунта экскаватором")
@@ -250,6 +307,56 @@ class PublicApiTest(unittest.TestCase):
             rows = portal.search_public_indices("бульдозер", filters)
         self.assertEqual(rows, [expected])
         self.assertFalse(get_json.call_args_list[2].args[1]["isMaterials"])
+
+    def test_labor_price_search_reads_current_registry_and_filters_locally(self):
+        filters = {"subject": {"id": 1}, "zone": {"id": 2}, "period": {"id": 3}, "authority": None}
+        rows = [
+            {"code": "1-100-10", "salaryRateName": "Средний разряд работы 1,0", "salary": "444.77"},
+            {"code": "1-100-20", "salaryRateName": "Средний разряд работы 2,0", "salary": "500.00"},
+        ]
+        with patch.object(portal, "get_json", return_value={"total": 2, "items": rows}) as get_json:
+            found = portal.search_public_labor_prices("1-100-10", filters)
+        self.assertEqual(found, [rows[0]])
+        self.assertEqual(get_json.call_args.args[0], "EstimatedPrice/RimWorkerSalaryRegistry")
+        self.assertEqual(get_json.call_args.args[1]["priceZoneId"], 2)
+
+    def test_auto_transport_resolves_page_filters_and_returns_rows(self):
+        filters = {
+            "subject": {"id": 1}, "zone": {"id": 2}, "period": {"id": 3},
+            "authority": {"id": 4}, "authorities": [{"id": 4, "name": "Организация"}],
+        }
+        row = {"transportationDistance": 1, "transportation1ClassCode": "05-06-1-03-0001", "price1Class": "277.59"}
+        with patch.object(portal, "get_json", side_effect=[
+            ["грунтовые дороги"], ["Автомобили-самосвалы"], ["до 10 т"], {"total": 1, "items": [row]},
+        ]) as get_json:
+            found = portal.search_public_transport_prices(
+                "0001", filters, "auto", "грунтовые", "самосвалы", "10 т",
+            )
+        self.assertEqual(found, [row])
+        self.assertEqual(get_json.call_args_list[0].args[0], "EstimatedPrice/Services/TransportationByAuto/RoadType")
+        self.assertEqual(get_json.call_args_list[3].args[0], "EstimatedPrice/Services/TransportationByAuto/Data")
+        self.assertEqual(get_json.call_args_list[3].args[1]["vehicleLoadCapacity"], "до 10 т")
+
+    def test_transport_tables_flatten_rail_groups_and_return_loading_rows(self):
+        filters = {"zone": {"id": 2}, "period": {"id": 3}, "authority": None}
+        rail = {"cargoName": "Грузы", "items": [{"code": "001", "interval": "до 10 км", "price": "12.00"}]}
+        with patch.object(portal, "get_json", return_value={"total": 1, "items": [rail]}):
+            rows = portal.search_public_transport_prices("001", filters, "rail")
+        self.assertEqual(rows[0]["cargoName"], "Грузы")
+        self.assertEqual(rows[0]["code"], "001")
+        loading = {"cargoName": "Бетоны", "loadPrice": "1407.05", "unloadPrice": "1203.76"}
+        with patch.object(portal, "get_json", return_value={"total": 1, "items": [loading]}):
+            rows = portal.search_public_transport_prices("бетоны", filters, "loading_auto")
+        self.assertEqual(rows, [loading])
+
+    def test_building_index_search_selects_endpoint_type_and_filters(self):
+        filters = {"zone": {"id": 2}, "period": {"id": 3}, "authority": None}
+        row = {"buildingTypeName": "Жилые здания", "indexFer": "1.12", "indexTer": None}
+        with patch.object(portal, "get_json", return_value={"total": 1, "items": [row]}) as get_json:
+            found = portal.search_public_building_indices("жилые", filters)
+        self.assertEqual(found, [row])
+        self.assertEqual(get_json.call_args.args[0], "IndicesOfChangeEstimatedPrice")
+        self.assertFalse(get_json.call_args.args[1]["hasDirectCostElementType"])
 
 
 if __name__ == "__main__":

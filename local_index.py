@@ -55,6 +55,8 @@ def sync_status() -> str:
             lines.append(f"  Редакция ФСНБ: {dataset['base_edition']}; норм проиндексировано: {dataset.get('norms_indexed', 0):,}")
         if dataset.get("resources_indexed"):
             lines.append(f"  Строк ресурсов: {dataset['resources_indexed']:,}")
+        if dataset.get("base_prices_indexed") is not None:
+            lines.append(f"  Базисные цены ресурсов: {dataset['base_prices_indexed']:,}")
     return "\n".join(lines)
 
 
@@ -78,6 +80,42 @@ def search_resources(query: str, kind: str = "all", limit: int = 10) -> list[dic
         sql += " ORDER BY CASE WHEN r.code=? THEN 0 WHEN r.code LIKE ? THEN 1 ELSE 2 END,r.code LIMIT ?"
         params.extend((query.strip(), query.strip() + "%", limit))
         return [dict(row) for row in db.execute(sql, params).fetchall()]
+
+
+def search_base_prices(query: str, kind: str = "all", limit: int = 10) -> list[dict[str, Any]]:
+    """Search source-reported FSBC base-price components by code or name."""
+    if not _tokens(query):
+        raise ValueError("Введите код или название ресурса для поиска базисной цены.")
+    if kind not in {"all", "materials", "machines"}:
+        raise ValueError("Тип базисной цены должен быть all, materials или machines.")
+    limit = max(1, min(int(limit), 25))
+    try:
+        with _db() as db:
+            sql = (
+                "SELECT b.code,b.name,b.unit,b.kind,b.source_file,b.edition,b.price_level,"
+                "b.components,b.source_url,b.source_name "
+                "FROM base_prices_fts f JOIN base_prices b ON b.id=f.rowid "
+                "WHERE base_prices_fts MATCH ?"
+            )
+            params: list[Any] = [_fts_query(query)]
+            if kind != "all":
+                sql += " AND b.kind=?"
+                params.append(kind)
+            sql += " ORDER BY CASE WHEN b.code=? THEN 0 WHEN b.code LIKE ? THEN 1 ELSE 2 END,b.code LIMIT ?"
+            params.extend((query.strip(), query.strip() + "%", limit))
+            results = []
+            for row in db.execute(sql, params).fetchall():
+                item = dict(row)
+                item["components"] = json.loads(item["components"])
+                results.append(item)
+            return results
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            raise ValueError(
+                "Локальная SQLite создана старой версией схемы; пересоберите индекс командой "
+                "`python sync_data.py --reindex` (или `python sync_data.py`, чтобы также обновить выгрузку)."
+            ) from exc
+        raise
 
 
 def search_norms(query: str, limit: int = 10, norm_code: str | None = None) -> list[dict[str, Any]]:
