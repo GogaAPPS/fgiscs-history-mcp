@@ -170,6 +170,7 @@ inv format
 - `.github/workflows/cd.yml` публикует image в GHCR при push в `main` или version tag `v*.*.*`. Чтобы собрать и развернуть другую ветку, запустите `CD` вручную в GitHub Actions и укажите её в поле `branch`; выберите `preproduction` или `production`.
 - Kubernetes получает обычные настройки из ConfigMap `fgis-config`. Ссылка на Secret `fgis-secrets` опциональна: секретов ФГИС ЦС сейчас нет. Образы и cache volume описаны в `k8s/`; init container загружает открытые наборы и строит SQLite при каждом rollout.
 - Деплой ожидает K3s/GitHub self-hosted runner с labels `self-hosted`, `linux`, `x64`, `k3s-deploy`, настроенным `KUBECONFIG`, StorageClass `local-path` и image pull secret `ghcr-pull` в выбранном namespace.
+- Перед первым деплоем администратор кластера должен создать cache PVC командой `kubectl -n apps apply -f k8s/pvc.yaml`. PVC сохраняет кэш между релизами, поэтому bootstrap его не меняет. Runnerу достаточно прав `get`, `create`, `patch`, `update` на Deployments, ConfigMaps и Services в namespace.
 
 GitHub Actions Variables можно задать для конкретного репозитория или GitHub Environment:
 
