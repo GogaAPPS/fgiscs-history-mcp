@@ -274,7 +274,7 @@ async def search_norms(query: str = "", norm_code: str = "", limit: int = 10) ->
 
 
 @mcp.tool()
-async def search_norms_batch(queries: list[str], limit: int = 5) -> str:
+async def search_norms_batch(queries: list[dict[str, str]], limit: int = 5) -> str:
     """Искать нормы ФСНБ сразу по нескольким описаниям работ одним вызовом MCP.
 
     Для каждого описания возвращает отдельный список подходящих норм, их состав,
@@ -285,15 +285,15 @@ async def search_norms_batch(queries: list[str], limit: int = 5) -> str:
         limit: Максимум результатов на одну формулировку, от 1 до 20.
     """
     cleaned_queries = []
-    seen_queries = set()
-    for query in queries:
-        if not isinstance(query, str):
+    seen_ids = set()
+    for item in queries:
+        if not isinstance(item, dict):
             continue
-        cleaned = query.strip()
-        key = cleaned.casefold()
-        if cleaned and key not in seen_queries:
-            cleaned_queries.append(cleaned)
-            seen_queries.add(key)
+        query_id = str(item.get("id", "")).strip()
+        query = str(item.get("text", "")).strip()
+        if query_id and query and query_id not in seen_ids:
+            cleaned_queries.append((query_id, query))
+            seen_ids.add(query_id)
 
     if not cleaned_queries:
         return json.dumps(
@@ -311,23 +311,37 @@ async def search_norms_batch(queries: list[str], limit: int = 5) -> str:
 
     result_limit = max(1, min(int(limit), 20))
     results = []
-    for query in cleaned_queries:
+    for query_id, query in cleaned_queries:
         try:
             rows = query_norms(query, result_limit)
         except (FileNotFoundError, ValueError, OSError) as exc:
-            results.append({"query": query, "status": "error", "error": str(exc)})
+            results.append({"query_id": query_id, "query": query, "status": "error", "matches": []})
         else:
             results.append(
                 {
+                    "query_id": query_id,
                     "query": query,
-                    "status": "ok",
-                    "match_count": len(rows),
-                    "matches": rows,
+                    "status": "ok" if rows else "not_found",
+                    "matches": [
+                        {
+                            **row,
+                            "edition": row.get("creation_date") or "ФСНБ-2022",
+                            "source_url": row.get("source_url") or SOURCE,
+                        }
+                        for row in rows
+                    ],
                 }
             )
 
     return json.dumps(
-        {"source": SOURCE, "results": results},
+        {
+            "contract_version": "1.0",
+            "tool": "search_norms_batch",
+            "status": "ok",
+            "source": {"name": "ФГИС ЦС / ФСНБ-2022", "url": SOURCE,
+                       "retrieved_at": retrieved_at(), "edition": "ФСНБ-2022"},
+            "results": results,
+        },
         ensure_ascii=False,
     )
 
