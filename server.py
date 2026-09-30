@@ -314,7 +314,7 @@ async def search_norms_batch(queries: list[dict[str, str]], limit: int = 5) -> s
     for query_id, query in cleaned_queries:
         try:
             rows = query_norms(query, result_limit)
-        except (FileNotFoundError, ValueError, OSError) as exc:
+        except (FileNotFoundError, ValueError, OSError):
             results.append({"query_id": query_id, "query": query, "status": "error", "matches": []})
         else:
             results.append(
