@@ -2,6 +2,7 @@
 """MCP server for FGIS CS public datasets and current price/index lookups."""
 import json
 import os
+from typing import Any
 import statistics
 from collections import defaultdict
 
@@ -274,7 +275,7 @@ async def search_norms(query: str = "", norm_code: str = "", limit: int = 10) ->
 
 
 @mcp.tool()
-async def search_norms_batch(queries: list[dict[str, str]], limit: int = 5) -> str:
+async def search_norms_batch(queries: list[dict[str, Any]], limit: int = 5) -> str:
     """Искать нормы ФСНБ сразу по нескольким описаниям работ одним вызовом MCP.
 
     Для каждого описания возвращает отдельный список подходящих норм, их состав,
@@ -292,7 +293,7 @@ async def search_norms_batch(queries: list[dict[str, str]], limit: int = 5) -> s
         query_id = str(item.get("id", "")).strip()
         query = str(item.get("text", "")).strip()
         if query_id and query and query_id not in seen_ids:
-            cleaned_queries.append((query_id, query))
+            cleaned_queries.append((query_id, query, str(item.get("unit", "")).strip()))
             seen_ids.add(query_id)
 
     if not cleaned_queries:
@@ -311,9 +312,9 @@ async def search_norms_batch(queries: list[dict[str, str]], limit: int = 5) -> s
 
     result_limit = max(1, min(int(limit), 20))
     results = []
-    for query_id, query in cleaned_queries:
+    for query_id, query, unit in cleaned_queries:
         try:
-            rows = query_norms(query, result_limit)
+            rows = query_norms(query, result_limit, expected_unit=unit or None)
         except (FileNotFoundError, ValueError, OSError):
             results.append({"query_id": query_id, "query": query, "status": "error", "matches": []})
         else:

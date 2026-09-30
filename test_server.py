@@ -146,6 +146,26 @@ class ToolTest(unittest.TestCase):
         self.assertIn(row["source_url"], output)
         search.assert_called_once_with("вода", "materials", 10)
 
+    def test_search_norms_batch_forwards_unit_and_returns_contract_rows(self):
+        row = {
+            "code": "11-01-047-01",
+            "name": "Устройство покрытий из плит керамогранитных",
+            "unit": "100 м2",
+            "creation_date": "14.08.2026",
+            "source_url": "https://fgiscs.minstroyrf.ru/source.zip",
+        }
+        with patch.object(server, "query_norms", return_value=[row]) as search:
+            output = call(
+                server.search_norms_batch,
+                queries=[{"id": "position-1", "text": "Укладка керамогранита", "unit": "м2"}],
+                limit=5,
+            )
+        result = json.loads(output)
+        self.assertEqual(result["contract_version"], "1.0")
+        self.assertEqual(result["results"][0]["query_id"], "position-1")
+        self.assertEqual(result["results"][0]["matches"][0]["code"], row["code"])
+        search.assert_called_once_with("Укладка керамогранита", 5, expected_unit="м2")
+
     def test_search_current_labor_prices_returns_unit_filters_and_source(self):
         filters = {
             "subject": {"id": 1, "name": "Новосибирская область"},

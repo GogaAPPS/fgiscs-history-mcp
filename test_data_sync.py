@@ -166,6 +166,27 @@ class LocalIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["code"], "01-01-001-01")
         self.assertEqual(rows[0]["resources"][0]["name"], "Песок строительный")
 
+    def test_norm_search_tolerates_extra_natural_language_words(self):
+        rows = local_index.search_norms("Выполнить разработку старого грунта экскаватором")
+        self.assertEqual(rows[0]["code"], "01-01-001-01")
+
+    def test_norm_search_uses_normative_vocabulary(self):
+        db = sqlite3.connect(local_index.INDEX_PATH)
+        db.execute(
+            "UPDATE norms SET name=?,search_text=? WHERE code=?",
+            ("Разборка покрытий полов", "Разборка покрытий полов", "01-01-001-01"),
+        )
+        db.execute("INSERT INTO norms_fts(norms_fts) VALUES('delete-all')")
+        norm_id = db.execute("SELECT rowid FROM norms WHERE code=?", ("01-01-001-01",)).fetchone()[0]
+        db.execute(
+            "INSERT INTO norms_fts(rowid,code,name,search_text) VALUES(?,?,?,?)",
+            (norm_id, "01-01-001-01", "Разборка покрытий полов", "Разборка покрытий полов"),
+        )
+        db.commit()
+        db.close()
+        rows = local_index.search_norms("Снятие старого покрытия пола")
+        self.assertEqual(rows[0]["code"], "01-01-001-01")
+
     def test_coefficient_search_returns_reference_not_value(self):
         rows = local_index.find_coefficient_references("грунта")
         self.assertEqual(rows[0]["availability"], "basis_reference_only")
