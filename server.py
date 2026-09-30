@@ -274,6 +274,65 @@ async def search_norms(query: str = "", norm_code: str = "", limit: int = 10) ->
 
 
 @mcp.tool()
+async def search_norms_batch(queries: list[str], limit: int = 5) -> str:
+    """Искать нормы ФСНБ сразу по нескольким описаниям работ одним вызовом MCP.
+
+    Для каждого описания возвращает отдельный список подходящих норм, их состав,
+    единицы, ресурсы и источники. Используйте для запроса с несколькими работами.
+
+    Args:
+        queries: Короткие отдельные формулировки работ, по одной на позицию.
+        limit: Максимум результатов на одну формулировку, от 1 до 20.
+    """
+    cleaned_queries = []
+    seen_queries = set()
+    for query in queries:
+        if not isinstance(query, str):
+            continue
+        cleaned = query.strip()
+        key = cleaned.casefold()
+        if cleaned and key not in seen_queries:
+            cleaned_queries.append(cleaned)
+            seen_queries.add(key)
+
+    if not cleaned_queries:
+        return json.dumps(
+            {"error": "Передайте хотя бы одно непустое описание работы.", "results": []},
+            ensure_ascii=False,
+        )
+    if len(cleaned_queries) > 25:
+        return json.dumps(
+            {
+                "error": "За один запрос можно проверить не более 25 описаний работ.",
+                "results": [],
+            },
+            ensure_ascii=False,
+        )
+
+    result_limit = max(1, min(int(limit), 20))
+    results = []
+    for query in cleaned_queries:
+        try:
+            rows = query_norms(query, result_limit)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            results.append({"query": query, "status": "error", "error": str(exc)})
+        else:
+            results.append(
+                {
+                    "query": query,
+                    "status": "ok",
+                    "match_count": len(rows),
+                    "matches": rows,
+                }
+            )
+
+    return json.dumps(
+        {"source": SOURCE, "results": results},
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
 async def search_current_prices(
     query: str,
     subject: str,
