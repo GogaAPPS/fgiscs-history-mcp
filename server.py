@@ -326,7 +326,7 @@ async def search_norms_batch(queries: list[dict[str, str]], limit: int = 5) -> s
                         {
                             **row,
                             "edition": row.get("creation_date") or "ФСНБ-2022",
-                            "source_url": row.get("source_url") or SOURCE,
+                            "source_url": row.get("source_url") or PORTAL_BASE,
                         }
                         for row in rows
                     ],
@@ -338,7 +338,7 @@ async def search_norms_batch(queries: list[dict[str, str]], limit: int = 5) -> s
             "contract_version": "1.0",
             "tool": "search_norms_batch",
             "status": "ok",
-            "source": {"name": "ФГИС ЦС / ФСНБ-2022", "url": SOURCE,
+            "source": {"name": "ФГИС ЦС / ФСНБ-2022", "url": PORTAL_BASE,
                        "retrieved_at": retrieved_at(), "edition": "ФСНБ-2022"},
             "results": results,
         },
