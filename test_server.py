@@ -232,7 +232,7 @@ class ToolTest(unittest.TestCase):
         result = json.loads(output)
         self.assertEqual(result["items"], [row])
         self.assertEqual(result["index_type"], "building_types")
-        self.assertIn("все доступные организации", result["authority"])
+        self.assertEqual(result["authority"], "")
         self.assertTrue(result["retrieved_at"])
         search.assert_called_once_with("жилые", filters, "building_types", 10)
 

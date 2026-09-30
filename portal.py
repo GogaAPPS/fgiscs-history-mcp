@@ -132,9 +132,9 @@ def resolve_price_filters(
     subjects = get_json("EstimatedPrice/CountrySubjects") or []
     selected_subject = _select(subjects, subject, "Субъект РФ")
     zones = get_json("EstimatedPrice/PriceZones", {"subjectId": selected_subject["id"]}) or []
-    if not price_zone and len(zones) > 1:
-        names = ", ".join(str(x.get("name", "")) for x in zones[:20])
-        raise PortalError(f"Для субъекта {selected_subject['name']} несколько ценовых зон; укажите одну: {names}")
+    # ФГИС orders zones in the same order as its UI. When a user supplied only
+    # a city/subject, use the first published zone instead of turning every
+    # resource lookup into the same clarification error.
     selected_zone = _select(zones, price_zone, "Ценовая зона")
     periods = get_json("EstimatedPrice/Periods", {"priceZoneId": selected_zone["id"]}) or []
     selected_period = _select(periods, period, "Период")

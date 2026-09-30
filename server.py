@@ -359,8 +359,8 @@ async def search_current_prices(
 ) -> str:
     """Запросить текущие цены материалов/машин из публичного API ФГИС ЦС.
 
-    Если период не задан, используется самый новый период портала. Если регион имеет
-    несколько ценовых зон, укажите зону; неоднозначные значения будут перечислены.
+    Если зона или период не заданы, используются первые значения актуальных
+    справочников портала (первая опубликованная зона и новейший период).
     """
     if not query.strip() or not subject.strip():
         return "Нужно указать поисковый запрос и субъект РФ."
@@ -375,7 +375,7 @@ async def search_current_prices(
         "subject": filters["subject"]["name"],
         "price_zone": filters["zone"]["name"],
         "period": filters["period"]["name"],
-        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
         "kind": kind,
         "query": query,
         "items": rows,
@@ -414,7 +414,7 @@ async def search_current_labor_prices(
         "subject": filters["subject"]["name"],
         "price_zone": filters["zone"]["name"],
         "period": filters["period"]["name"],
-        "authority": filters["authority"]["name"] if filters.get("authority") else "организация указана в каждой строке",
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
         "unit": "руб./чел.-ч",
         "query": query,
         "items": rows,
@@ -463,7 +463,7 @@ async def search_current_transport_prices(
         "subject": filters["subject"]["name"],
         "price_zone": filters["zone"]["name"],
         "period": filters["period"]["name"],
-        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
         "transport_type": transport_type,
         "unit": unit,
         "applied_filters": {
@@ -507,7 +507,7 @@ async def search_current_indices(
         "subject": filters["subject"]["name"],
         "price_zone": filters["zone"]["name"],
         "period": filters["period"]["name"],
-        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
         "index_type": index_type,
         "query": query,
         "field_meanings": {
@@ -550,7 +550,7 @@ async def search_current_building_indices(
         "subject": filters["subject"]["name"],
         "price_zone": filters["zone"]["name"],
         "period": filters["period"]["name"],
-        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
         "index_type": index_type,
         "unit": "индекс (безразмерная величина)",
         "query": query,

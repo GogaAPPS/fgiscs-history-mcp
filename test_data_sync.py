@@ -194,7 +194,7 @@ class LocalIndexTest(unittest.TestCase):
 
 
 class PublicApiTest(unittest.TestCase):
-    def test_price_filters_choose_latest_defaults_and_reject_ambiguous_zone(self):
+    def test_price_filters_choose_first_zone_and_latest_period_by_default(self):
         responses = {
             "EstimatedPrice/CountrySubjects": [{"id": 1, "name": "Новосибирская область"}],
             "EstimatedPrice/PriceZones": [{"id": 10, "name": "1 зона"}, {"id": 11, "name": "2 зона"}],
@@ -202,8 +202,10 @@ class PublicApiTest(unittest.TestCase):
             "EstimatedPrice/Authorities": [],
         }
         with patch.object(portal, "get_json", side_effect=lambda path, params=None: responses[path]):
-            with self.assertRaises(portal.PortalError):
-                portal.resolve_price_filters("Новосибирская")
+            filters = portal.resolve_price_filters("Новосибирская")
+        self.assertEqual(filters["subject"]["name"], "Новосибирская область")
+        self.assertEqual(filters["zone"]["id"], 10)
+        self.assertEqual(filters["period"]["id"], 9)
 
     def test_price_filters_accept_explicit_region_zone_period(self):
         responses = {
