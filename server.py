@@ -2,11 +2,13 @@
 """MCP server for FGIS CS public datasets and current price/index lookups."""
 import json
 import os
+from typing import Any
 import statistics
 from collections import defaultdict
 
 from mcp.server import MCPServer
-from local_index import find_coefficient_references, search_norms as query_norms
+from local_index import find_coefficient_references, search_base_prices as query_base_prices
+from local_index import search_norms as query_norms
 from local_index import search_resources as query_resources
 from local_index import sync_status
 from portal import (
@@ -15,8 +17,11 @@ from portal import (
     list_open_datasets as fetch_open_datasets,
     resolve_price_filters,
     retrieved_at,
+    search_public_building_indices,
     search_public_indices,
+    search_public_labor_prices,
     search_public_prices,
+    search_public_transport_prices,
 )
 
 mcp = MCPServer("fgiscs-history", log_level=os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -217,6 +222,32 @@ async def search_construction_resources(query: str, kind: str = "all", limit: in
 
 
 @mcp.tool()
+async def search_base_resource_prices(query: str, kind: str = "all", limit: int = 10) -> str:
+    """Искать базисные цены материалов и машин в локальной выгрузке ФСНБ.
+
+    Возвращает опубликованные компоненты цены без их самостоятельного суммирования.
+    Для добавления таблиц ФСБЦ запустите `python sync_data.py` или `python sync_data.py --reindex`.
+    """
+    try:
+        rows = query_base_prices(query, kind, limit)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        return str(exc)
+    if not rows:
+        return f"Базисная цена не найдена по запросу {query!r}. Проверьте синхронизацию ФСНБ.\n{sync_status()}"
+    lines = [f"Найдено базисных цен: {len(rows)}. Компоненты приведены в исходном виде ФСНБ:"]
+    for row in rows:
+        lines.append(
+            f"\n{row['code']} — {row['name']}\n"
+            f"Тип: {row['kind']}; единица: {row['unit']}; "
+            f"уровень цен: {row['price_level'] or 'не указан в источнике'}; "
+            f"редакция: {row['edition'] or 'не указана в источнике'}\n"
+            f"Файл: {row['source_file']}; компоненты: {json.dumps(row['components'], ensure_ascii=False)}\n"
+            f"Источник: {row['source_url']}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def search_norms(query: str = "", norm_code: str = "", limit: int = 10) -> str:
     """Искать нормы ФСНБ по коду, описанию или составу ресурсов.
 
@@ -244,6 +275,79 @@ async def search_norms(query: str = "", norm_code: str = "", limit: int = 10) ->
 
 
 @mcp.tool()
+async def search_norms_batch(queries: list[dict[str, Any]], limit: int = 5) -> str:
+    """Искать нормы ФСНБ сразу по нескольким описаниям работ одним вызовом MCP.
+
+    Для каждого описания возвращает отдельный список подходящих норм, их состав,
+    единицы, ресурсы и источники. Используйте для запроса с несколькими работами.
+
+    Args:
+        queries: Короткие отдельные формулировки работ, по одной на позицию.
+        limit: Максимум результатов на одну формулировку, от 1 до 20.
+    """
+    cleaned_queries = []
+    seen_ids = set()
+    for item in queries:
+        if not isinstance(item, dict):
+            continue
+        query_id = str(item.get("id", "")).strip()
+        query = str(item.get("text", "")).strip()
+        if query_id and query and query_id not in seen_ids:
+            cleaned_queries.append((query_id, query, str(item.get("unit", "")).strip()))
+            seen_ids.add(query_id)
+
+    if not cleaned_queries:
+        return json.dumps(
+            {"error": "Передайте хотя бы одно непустое описание работы.", "results": []},
+            ensure_ascii=False,
+        )
+    if len(cleaned_queries) > 25:
+        return json.dumps(
+            {
+                "error": "За один запрос можно проверить не более 25 описаний работ.",
+                "results": [],
+            },
+            ensure_ascii=False,
+        )
+
+    result_limit = max(1, min(int(limit), 20))
+    results = []
+    for query_id, query, unit in cleaned_queries:
+        try:
+            rows = query_norms(query, result_limit, expected_unit=unit or None)
+        except (FileNotFoundError, ValueError, OSError):
+            results.append({"query_id": query_id, "query": query, "status": "error", "matches": []})
+        else:
+            results.append(
+                {
+                    "query_id": query_id,
+                    "query": query,
+                    "status": "ok" if rows else "not_found",
+                    "matches": [
+                        {
+                            **row,
+                            "edition": row.get("creation_date") or "ФСНБ-2022",
+                            "source_url": row.get("source_url") or PORTAL_BASE,
+                        }
+                        for row in rows
+                    ],
+                }
+            )
+
+    return json.dumps(
+        {
+            "contract_version": "1.0",
+            "tool": "search_norms_batch",
+            "status": "ok",
+            "source": {"name": "ФГИС ЦС / ФСНБ-2022", "url": PORTAL_BASE,
+                       "retrieved_at": retrieved_at(), "edition": "ФСНБ-2022"},
+            "results": results,
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
 async def search_current_prices(
     query: str,
     subject: str,
@@ -255,8 +359,8 @@ async def search_current_prices(
 ) -> str:
     """Запросить текущие цены материалов/машин из публичного API ФГИС ЦС.
 
-    Если период не задан, используется самый новый период портала. Если регион имеет
-    несколько ценовых зон, укажите зону; неоднозначные значения будут перечислены.
+    Если зона или период не заданы, используются первые значения актуальных
+    справочников портала (первая опубликованная зона и новейший период).
     """
     if not query.strip() or not subject.strip():
         return "Нужно указать поисковый запрос и субъект РФ."
@@ -271,13 +375,107 @@ async def search_current_prices(
         "subject": filters["subject"]["name"],
         "price_zone": filters["zone"]["name"],
         "period": filters["period"]["name"],
-        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
         "kind": kind,
         "query": query,
         "items": rows,
     }
     if not rows:
         return "По заданным фильтрам портал не вернул опубликованных цен.\n" + json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_current_labor_prices(
+    query: str,
+    subject: str,
+    period: str = "",
+    price_zone: str = "",
+    authority: str = "",
+    limit: int = 10,
+) -> str:
+    """Искать текущую сметную цену труда из публичного реестра ФГИС ЦС.
+
+    Цена выдаётся в руб./чел.-ч. Укажите регион и при необходимости период,
+    зону и отраслевую организацию. Поиск поддерживает код (например, 1-100-10),
+    наименование или разряд.
+    """
+    if not subject.strip():
+        return "Нужно указать субъект РФ."
+    try:
+        filters = resolve_price_filters(subject, period or None, price_zone or None, authority or None)
+        rows = search_public_labor_prices(query, filters, limit)
+    except (PortalError, ValueError, TypeError) as exc:
+        return str(exc)
+    result = {
+        "source": f"{PORTAL_BASE}/prices",
+        "api": f"{PORTAL_BASE}/api/EstimatedPrice/RimWorkerSalaryRegistry",
+        "retrieved_at": retrieved_at(),
+        "subject": filters["subject"]["name"],
+        "price_zone": filters["zone"]["name"],
+        "period": filters["period"]["name"],
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
+        "unit": "руб./чел.-ч",
+        "query": query,
+        "items": rows,
+    }
+    if not rows:
+        return "Портал не вернул строк труда по этому запросу и фильтрам.\n" + json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_current_transport_prices(
+    query: str = "",
+    subject: str = "",
+    period: str = "",
+    price_zone: str = "",
+    authority: str = "",
+    transport_type: str = "rail",
+    road_type: str = "",
+    vehicle_type: str = "",
+    vehicle_load_capacity: str = "",
+    limit: int = 10,
+) -> str:
+    """Искать цены автомобильной/железнодорожной перевозки и автопогрузки.
+
+    transport_type: rail, auto или loading_auto. Для auto передайте организацию,
+    тип дорог, автотранспортное средство и грузоподъёмность/объём барабана.
+    """
+    if not subject.strip():
+        return "Нужно указать субъект РФ."
+    try:
+        filters = resolve_price_filters(subject, period or None, price_zone or None, authority or None)
+        rows = search_public_transport_prices(
+            query, filters, transport_type, road_type or None,
+            vehicle_type or None, vehicle_load_capacity or None, limit,
+        )
+    except (PortalError, ValueError, TypeError) as exc:
+        return str(exc)
+    unit = {
+        "rail": "руб./т; тарифный интервал расстояния указан в строке",
+        "loading_auto": "руб./т отдельно для погрузки и разгрузки",
+        "auto": "руб./т; цена зависит от расстояния и класса груза",
+    }.get(transport_type, "см. единицы в строках портала")
+    result = {
+        "source": f"{PORTAL_BASE}/prices",
+        "retrieved_at": retrieved_at(),
+        "subject": filters["subject"]["name"],
+        "price_zone": filters["zone"]["name"],
+        "period": filters["period"]["name"],
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
+        "transport_type": transport_type,
+        "unit": unit,
+        "applied_filters": {
+            "road_type": road_type or None,
+            "vehicle_type": vehicle_type or None,
+            "vehicle_load_capacity": vehicle_load_capacity or None,
+        },
+        "query": query,
+        "items": rows,
+    }
+    if not rows:
+        return "Портал не вернул строк транспортных услуг для этих фильтров.\n" + json.dumps(result, ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -309,7 +507,7 @@ async def search_current_indices(
         "subject": filters["subject"]["name"],
         "price_zone": filters["zone"]["name"],
         "period": filters["period"]["name"],
-        "authority": filters["authority"]["name"] if filters.get("authority") else "все доступные организации",
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
         "index_type": index_type,
         "query": query,
         "field_meanings": {
@@ -321,6 +519,45 @@ async def search_current_indices(
     }
     if not rows:
         return "Публичный API не вернул подходящих строк индексов для этих фильтров.\n" + json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_current_building_indices(
+    query: str,
+    subject: str,
+    period: str = "",
+    price_zone: str = "",
+    authority: str = "",
+    index_type: str = "building_types",
+    limit: int = 10,
+) -> str:
+    """Искать текущие индексы по видам объектов или элементам прямых затрат.
+
+    Этот инструмент дополняет `search_current_indices`, который ищет индексы
+    к группам однородных ресурсов. index_type: building_types или direct_cost_elements.
+    """
+    if not query.strip() or not subject.strip():
+        return "Нужно указать поисковый запрос и субъект РФ."
+    try:
+        filters = resolve_price_filters(subject, period or None, price_zone or None, authority or None)
+        rows = search_public_building_indices(query, filters, index_type, limit)
+    except (PortalError, ValueError, TypeError) as exc:
+        return str(exc)
+    result = {
+        "source": f"{PORTAL_BASE}/prices",
+        "retrieved_at": retrieved_at(),
+        "subject": filters["subject"]["name"],
+        "price_zone": filters["zone"]["name"],
+        "period": filters["period"]["name"],
+        "authority": filters["authority"]["name"] if filters.get("authority") else "",
+        "index_type": index_type,
+        "unit": "индекс (безразмерная величина)",
+        "query": query,
+        "items": rows,
+    }
+    if not rows:
+        return "Публичный API не вернул индексы по этим фильтрам.\n" + json.dumps(result, ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

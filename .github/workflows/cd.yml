@@ -156,6 +156,15 @@ jobs:
         with:
           ref: ${{ needs.build.outputs.ref_name }}
 
+      - name: Validate Kubernetes access
+        run: |
+          set -Eeuo pipefail
+          for verb in get create patch update; do
+            kubectl auth can-i "$verb" deployments.apps -n "$K8S_NAMESPACE"
+            kubectl auth can-i "$verb" configmaps -n "$K8S_NAMESPACE"
+            kubectl auth can-i "$verb" services -n "$K8S_NAMESPACE"
+          done
+
       - name: Bootstrap or update deployment
         env:
           IMAGE: ${{ needs.build.outputs.image_ref }}

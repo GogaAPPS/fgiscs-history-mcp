@@ -132,9 +132,9 @@ def resolve_price_filters(
     subjects = get_json("EstimatedPrice/CountrySubjects") or []
     selected_subject = _select(subjects, subject, "Субъект РФ")
     zones = get_json("EstimatedPrice/PriceZones", {"subjectId": selected_subject["id"]}) or []
-    if not price_zone and len(zones) > 1:
-        names = ", ".join(str(x.get("name", "")) for x in zones[:20])
-        raise PortalError(f"Для субъекта {selected_subject['name']} несколько ценовых зон; укажите одну: {names}")
+    # ФГИС orders zones in the same order as its UI. When a user supplied only
+    # a city/subject, use the first published zone instead of turning every
+    # resource lookup into the same clarification error.
     selected_zone = _select(zones, price_zone, "Ценовая зона")
     periods = get_json("EstimatedPrice/Periods", {"priceZoneId": selected_zone["id"]}) or []
     selected_period = _select(periods, period, "Период")
@@ -281,3 +281,147 @@ def search_public_indices(
                     break
         return rows
     raise PortalError("Пока поддерживаются только индексы к группам однородных строительных ресурсов.")
+
+
+def _paged_table_rows(path: str, params: dict[str, Any], *, flatten_groups: bool = False) -> list[dict[str, Any]]:
+    """Read every page of a public table, failing rather than returning a partial result."""
+    take = 200
+    rows: list[dict[str, Any]] = []
+    total: int | None = None
+    for page in range(1, 51):
+        result = get_json(path, {**params, "page": page, "take": take})
+        if isinstance(result, list):
+            page_items = result
+            total = len(result)
+        elif isinstance(result, dict) and isinstance(result.get("items"), list):
+            page_items = result["items"]
+            if result.get("total") is not None:
+                total = int(result["total"])
+        else:
+            raise PortalError(f"Таблица {path} вернула неподдерживаемую структуру.")
+
+        for item in page_items:
+            if not isinstance(item, dict):
+                raise PortalError(f"Таблица {path} содержит строку неподдерживаемого формата.")
+            nested = item.get("items")
+            if flatten_groups and isinstance(nested, list):
+                for child in nested:
+                    if not isinstance(child, dict):
+                        raise PortalError(f"Таблица {path} содержит вложенную строку неподдерживаемого формата.")
+                    rows.append({**item, **child, "items": None})
+            else:
+                rows.append(item)
+
+        if total is None or len(page_items) < take or page * take >= total:
+            return rows
+    raise PortalError(f"Таблица {path} превышает лимит чтения; вернулась только часть данных.")
+
+
+def _filter_rows(rows: list[dict[str, Any]], query: str, limit: int) -> list[dict[str, Any]]:
+    needle = query.strip().casefold()
+    if needle:
+        rows = [row for row in rows if needle in json.dumps(row, ensure_ascii=False).casefold()]
+    return rows[:max(1, min(int(limit), 25))]
+
+
+def search_public_labor_prices(
+    query: str,
+    filters: dict[str, Any],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Search the public RIM labor-price registry in rubles per person-hour."""
+    params: dict[str, Any] = {
+        "periodId": filters["period"]["id"],
+        "priceZoneId": filters["zone"]["id"],
+    }
+    if filters.get("authority"):
+        params["authorityId"] = filters["authority"]["id"]
+    rows = _paged_table_rows("EstimatedPrice/RimWorkerSalaryRegistry", params)
+    return _filter_rows(rows, query, limit)
+
+
+def _select_option(options: list[Any], needle: str | None, label: str) -> Any:
+    if not options:
+        raise PortalError(f"ФГИС ЦС не вернула варианты для фильтра «{label}».")
+    if not needle:
+        if len(options) == 1:
+            return options[0]
+        names = ", ".join(str(item.get("name", item.get("label", item))) if isinstance(item, dict) else str(item) for item in options[:20])
+        raise PortalError(f"Укажите фильтр «{label}». Доступны варианты: {names}")
+    folded = needle.strip().casefold()
+    labels = [str(item.get("name", item.get("label", item))) if isinstance(item, dict) else str(item) for item in options]
+    exact = [i for i, name in enumerate(labels) if name.strip().casefold() == folded]
+    matches = exact or [i for i, name in enumerate(labels) if folded in name.casefold()]
+    if len(matches) == 1:
+        return options[matches[0]]
+    if not matches:
+        raise PortalError(f"Значение фильтра «{label}» {needle!r} не найдено. Доступны варианты: {', '.join(labels[:20])}")
+    raise PortalError(f"Значение фильтра «{label}» неоднозначно: {', '.join(labels[i] for i in matches[:20])}")
+
+
+def search_public_transport_prices(
+    query: str,
+    filters: dict[str, Any],
+    transport_type: str = "rail",
+    road_type: str | None = None,
+    vehicle_type: str | None = None,
+    vehicle_load_capacity: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Search the public road/rail freight and road loading price tables."""
+    common: dict[str, Any] = {
+        "periodId": filters["period"]["id"],
+        "priceZoneId": filters["zone"]["id"],
+    }
+    if filters.get("authority"):
+        common["authorityId"] = filters["authority"]["id"]
+
+    if transport_type == "rail":
+        rows = _paged_table_rows("EstimatedPrice/Services/TransportationByRail", common, flatten_groups=True)
+    elif transport_type == "loading_auto":
+        rows = _paged_table_rows("EstimatedPrice/Services/LoadWorksByAuto", common)
+    elif transport_type == "auto":
+        if not filters.get("authority"):
+            names = ", ".join(str(item.get("name", "")) for item in filters.get("authorities", [])[:20])
+            raise PortalError(f"Для автомобильной перевозки укажите отраслевую организацию. Варианты: {names or 'нет доступных'}")
+        common["subjectId"] = filters["subject"]["id"]
+        road_types = get_json("EstimatedPrice/Services/TransportationByAuto/RoadType", common) or []
+        selected_road = _select_option(road_types, road_type, "тип дорог")
+        road_value = selected_road.get("name", selected_road) if isinstance(selected_road, dict) else selected_road
+        vehicle_types = get_json("EstimatedPrice/Services/TransportationByAuto/VehicleType", {
+            **common, "roadType": road_value,
+        }) or []
+        selected_vehicle = _select_option(vehicle_types, vehicle_type, "тип автотранспортного средства")
+        vehicle_value = selected_vehicle.get("name", selected_vehicle) if isinstance(selected_vehicle, dict) else selected_vehicle
+        capacities = get_json("EstimatedPrice/Services/TransportationByAuto/VehicleLoadCapacity", {
+            **common, "roadType": road_value, "vehicleType": vehicle_value,
+        }) or []
+        selected_capacity = _select_option(capacities, vehicle_load_capacity, "грузоподъёмность/объём барабана")
+        capacity_value = selected_capacity.get("name", selected_capacity) if isinstance(selected_capacity, dict) else selected_capacity
+        rows = _paged_table_rows("EstimatedPrice/Services/TransportationByAuto/Data", {
+            **common, "roadType": road_value, "vehicleType": vehicle_value,
+            "vehicleLoadCapacity": capacity_value,
+        })
+    else:
+        raise PortalError("Тип услуги должен быть auto, loading_auto или rail.")
+    return _filter_rows(rows, query, limit)
+
+
+def search_public_building_indices(
+    query: str,
+    filters: dict[str, Any],
+    index_type: str = "building_types",
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Search public construction-object or direct-cost-element index tables."""
+    if index_type not in {"building_types", "direct_cost_elements"}:
+        raise PortalError("Тип индекса должен быть building_types или direct_cost_elements.")
+    params: dict[str, Any] = {
+        "periodId": filters["period"]["id"],
+        "priceZoneId": filters["zone"]["id"],
+        "hasDirectCostElementType": index_type == "direct_cost_elements",
+    }
+    if filters.get("authority"):
+        params["authorityId"] = filters["authority"]["id"]
+    rows = _paged_table_rows("IndicesOfChangeEstimatedPrice", params)
+    return _filter_rows(rows, query, limit)

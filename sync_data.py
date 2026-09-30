@@ -41,6 +41,18 @@ def _tag(element: ET.Element) -> str:
     return element.tag.rsplit("}", 1)[-1]
 
 
+def _zip_filename(info: zipfile.ZipInfo) -> str:
+    """Recover legacy Russian CP866 ZIP names that zipfile decodes as CP437."""
+    if info.flag_bits & 0x800:
+        return info.filename
+    try:
+        return info.filename.encode("cp437").decode("cp866")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        # UTF-8 names (flagged by ZIP) and ordinary Unicode names are already
+        # decoded by zipfile and cannot be represented as CP437 bytes.
+        return info.filename
+
+
 def _xml_text(element: ET.Element, name: str) -> str:
     child = next((item for item in element if _tag(item) == name), None)
     return (child.text or "").strip() if child is not None else ""
@@ -98,16 +110,18 @@ def _parse_fsnb_zip(data: bytes, db: sqlite3.Connection, source_url: str, source
     norms_added = 0
     resources_added = 0
     editions: list[str] = []
-    xml_files = [entry for entry in archive.infolist() if entry.filename.lower().endswith(".xml")]
+    xml_files = [entry for entry in archive.infolist() if _zip_filename(entry).lower().endswith(".xml")]
     if not xml_files:
         raise PortalError("В архиве ФСНБ не найдены XML-файлы.")
 
     for info in xml_files:
-        file_base = Path(info.filename).stem
+        source_file = _zip_filename(info)
+        file_base = Path(source_file).stem
         try:
             xml_stream: BinaryIO = archive.open(info)
             stack: list[dict[str, str]] = []
             root_attrs: dict[str, str] = {}
+            catalog_meta: dict[str, str] = {}
             for event, element in ET.iterparse(xml_stream, events=("start", "end")):
                 tag = _tag(element)
                 if event == "start":
@@ -128,6 +142,40 @@ def _parse_fsnb_zip(data: bytes, db: sqlite3.Connection, source_url: str, source
                         _resource_kind(attrs.get("Code", ""), attrs.get("Name", "")),
                     )
                     resources_added += 1
+
+                    # FSNB-2022 publishes base prices in two dedicated XML
+                    # catalogs. Keep every source component verbatim: machine
+                    # prices are componentized and must not be collapsed into
+                    # a guessed total by the indexer.
+                    if file_base in {"ФСБЦ_Мат&Оборуд", "ФСБЦ_Маш"}:
+                        component_data: dict[str, Any] = {"prices": [], "expendable_materials": []}
+                        for child in element.iter():
+                            child_tag = _tag(child)
+                            if child_tag == "Price":
+                                component_data["prices"].append(dict(child.attrib))
+                            elif child_tag == "Material":
+                                component_data["expendable_materials"].append(dict(child.attrib))
+                        if component_data["prices"] or component_data["expendable_materials"]:
+                            code = attrs.get("Code", "").strip()
+                            name = attrs.get("Name") or attrs.get("EndName", "")
+                            unit = attrs.get("MeasureUnit", "")
+                            db.execute(
+                                "INSERT OR REPLACE INTO base_prices "
+                                "(code,name,unit,kind,source_file,edition,price_level,components,source_url,source_name) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                (
+                                    code, name.strip(), unit.strip(),
+                                    "machines" if file_base == "ФСБЦ_Маш" else "materials",
+                                    source_file,
+                                    root_attrs.get("CreationDate", "") or catalog_meta.get("ApprovingActDate", ""),
+                                    root_attrs.get("PriceLevel", ""),
+                                    json.dumps(component_data, ensure_ascii=False), source_url, source_name,
+                                ),
+                            )
+                        element.clear()
+
+                if tag in {"ApprovingActNumber", "ApprovingActDate"} and element.text:
+                    catalog_meta[tag] = element.text.strip()
 
                 if tag == "Work":
                     attrs = element.attrib
@@ -221,6 +269,17 @@ def _create_database(path: Path) -> sqlite3.Connection:
         CREATE INDEX resources_code ON resources(code);
         CREATE INDEX resources_kind ON resources(kind);
         CREATE VIRTUAL TABLE resources_fts USING fts5(code,name,okpd2,content='');
+        CREATE TABLE base_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL, name TEXT NOT NULL, unit TEXT NOT NULL,
+            kind TEXT NOT NULL, source_file TEXT NOT NULL, edition TEXT NOT NULL,
+            price_level TEXT NOT NULL, components TEXT NOT NULL,
+            source_url TEXT NOT NULL, source_name TEXT NOT NULL,
+            UNIQUE(code,source_file,source_name)
+        );
+        CREATE INDEX base_prices_code ON base_prices(code);
+        CREATE INDEX base_prices_kind ON base_prices(kind);
+        CREATE VIRTUAL TABLE base_prices_fts USING fts5(code,name,content='');
         CREATE TABLE norms (
             code TEXT NOT NULL, name TEXT NOT NULL, unit TEXT NOT NULL,
             base_type TEXT NOT NULL, base_name TEXT NOT NULL, price_level TEXT NOT NULL,
@@ -245,6 +304,10 @@ def _rebuild_fts(db: sqlite3.Connection) -> None:
     db.execute(
         "INSERT INTO resources_fts(rowid,code,name,okpd2) "
         "SELECT rowid,code,name,okpd2 FROM resources"
+    )
+    db.execute(
+        "INSERT INTO base_prices_fts(rowid,code,name) "
+        "SELECT id,code,name FROM base_prices"
     )
     db.execute(
         "INSERT INTO norms_fts(rowid,code,name,search_text) "
@@ -314,11 +377,15 @@ def synchronize(dataset_ids: tuple[str, ...] = DEFAULT_IDS) -> dict[str, Any]:
                 record["norms_indexed"], record["resources_indexed"], record["base_edition"] = _parse_fsnb_zip(
                     raw, db, source_url, display_name,
                 )
+                record["base_prices_indexed"] = db.execute(
+                    "SELECT COUNT(*) FROM base_prices WHERE source_name=?", (display_name,),
+                ).fetchone()[0]
             manifest["datasets"].append(record)
         _rebuild_fts(db)
         db.commit()
         db.execute("INSERT INTO norms_fts(norms_fts) VALUES('optimize')")
         db.execute("INSERT INTO resources_fts(resources_fts) VALUES('optimize')")
+        db.execute("INSERT INTO base_prices_fts(base_prices_fts) VALUES('optimize')")
         db.execute("INSERT INTO norm_resources_fts(norm_resources_fts) VALUES('optimize')")
         db.commit()
         db.close()
@@ -368,10 +435,14 @@ def reindex_cached(dataset_ids: tuple[str, ...] | None = None) -> dict[str, Any]
                 record["norms_indexed"], record["resources_indexed"], record["base_edition"] = _parse_fsnb_zip(
                     raw, db, record["source_url"], record["file_name"],
                 )
+                record["base_prices_indexed"] = db.execute(
+                    "SELECT COUNT(*) FROM base_prices WHERE source_name=?", (record["file_name"],),
+                ).fetchone()[0]
         _rebuild_fts(db)
         db.commit()
         db.execute("INSERT INTO norms_fts(norms_fts) VALUES('optimize')")
         db.execute("INSERT INTO resources_fts(resources_fts) VALUES('optimize')")
+        db.execute("INSERT INTO base_prices_fts(base_prices_fts) VALUES('optimize')")
         db.execute("INSERT INTO norm_resources_fts(norm_resources_fts) VALUES('optimize')")
         db.commit()
         db.close()

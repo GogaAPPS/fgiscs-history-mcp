@@ -125,6 +125,117 @@ class ToolTest(unittest.TestCase):
                 self.assertTrue(result["retrieved_at"])
                 self.assertEqual(search.call_args.args[2], kind)
 
+    def test_search_base_resource_prices_returns_components_and_source(self):
+        row = {
+            "code": "01.7.03.01-0002",
+            "name": "Вода водопроводная",
+            "unit": "м3",
+            "kind": "materials",
+            "source_file": "ФСБЦ_Мат&Оборуд.xml",
+            "edition": "20260812",
+            "price_level": "базисный",
+            "components": {"prices": [{"Cost": "12.5", "OptCost": "14.0"}]},
+            "source_url": "https://fgiscs.minstroyrf.ru/source.zip",
+            "source_name": "ФСНБ-2022",
+        }
+        with patch.object(server, "query_base_prices", return_value=[row]) as search:
+            output = call(server.search_base_resource_prices, query="вода", kind="materials")
+        self.assertIn("ФСБЦ_Мат&Оборуд.xml", output)
+        self.assertIn("20260812", output)
+        self.assertIn('"OptCost": "14.0"', output)
+        self.assertIn(row["source_url"], output)
+        search.assert_called_once_with("вода", "materials", 10)
+
+    def test_search_norms_batch_forwards_unit_and_returns_contract_rows(self):
+        row = {
+            "code": "11-01-047-01",
+            "name": "Устройство покрытий из плит керамогранитных",
+            "unit": "100 м2",
+            "creation_date": "14.08.2026",
+            "source_url": "https://fgiscs.minstroyrf.ru/source.zip",
+        }
+        with patch.object(server, "query_norms", return_value=[row]) as search:
+            output = call(
+                server.search_norms_batch,
+                queries=[{"id": "position-1", "text": "Укладка керамогранита", "unit": "м2"}],
+                limit=5,
+            )
+        result = json.loads(output)
+        self.assertEqual(result["contract_version"], "1.0")
+        self.assertEqual(result["results"][0]["query_id"], "position-1")
+        self.assertEqual(result["results"][0]["matches"][0]["code"], row["code"])
+        search.assert_called_once_with("Укладка керамогранита", 5, expected_unit="м2")
+
+    def test_search_current_labor_prices_returns_unit_filters_and_source(self):
+        filters = {
+            "subject": {"id": 1, "name": "Новосибирская область"},
+            "zone": {"id": 2, "name": "1 зона"},
+            "period": {"id": 3, "name": "3 квартал 2026"},
+            "authority": {"id": 4, "name": "Минстрой"},
+        }
+        row = {"code": "1-100-10", "salaryRateRank": "1.0", "salary": "444.77"}
+        with patch.object(server, "resolve_price_filters", return_value=filters), patch.object(
+            server, "search_public_labor_prices", return_value=[row]
+        ) as search:
+            output = call(
+                server.search_current_labor_prices,
+                query="1-100-10", subject="Новосибирская область", period="3 квартал 2026",
+                price_zone="1 зона", authority="Минстрой",
+            )
+        result = json.loads(output)
+        self.assertEqual(result["items"], [row])
+        self.assertEqual(result["unit"], "руб./чел.-ч")
+        self.assertEqual(result["subject"], filters["subject"]["name"])
+        self.assertTrue(result["source"].endswith("/prices"))
+        self.assertTrue(result["api"].endswith("/RimWorkerSalaryRegistry"))
+        search.assert_called_once_with("1-100-10", filters, 10)
+
+    def test_search_current_transport_prices_returns_source_and_filters(self):
+        filters = {
+            "subject": {"id": 1, "name": "Новосибирская область"},
+            "zone": {"id": 2, "name": "1 зона"},
+            "period": {"id": 3, "name": "3 квартал 2026"},
+            "authority": {"id": 4, "name": "РОСАТОМ"},
+        }
+        row = {"code": "1", "interval": "до 10 км", "price": "19.50"}
+        with patch.object(server, "resolve_price_filters", return_value=filters), patch.object(
+            server, "search_public_transport_prices", return_value=[row]
+        ) as search:
+            output = call(
+                server.search_current_transport_prices,
+                query="грунтовые", subject="Новосибирская область", authority="РОСАТОМ",
+                transport_type="rail", road_type="грунтовые", limit=5,
+            )
+        result = json.loads(output)
+        self.assertEqual(result["items"], [row])
+        self.assertEqual(result["unit"], "руб./т; тарифный интервал расстояния указан в строке")
+        self.assertEqual(result["transport_type"], "rail")
+        self.assertEqual(result["applied_filters"]["road_type"], "грунтовые")
+        self.assertTrue(result["source"].endswith("/prices"))
+        search.assert_called_once_with("грунтовые", filters, "rail", "грунтовые", None, None, 5)
+
+    def test_search_current_building_indices_is_separate_from_resource_group_indices(self):
+        filters = {
+            "subject": {"id": 1, "name": "Новосибирская область"},
+            "zone": {"id": 2, "name": "1 зона"},
+            "period": {"id": 3, "name": "3 квартал 2026"},
+            "authority": None,
+        }
+        row = {"buildingTypeName": "Жилые здания", "indexFer": "7.81"}
+        with patch.object(server, "resolve_price_filters", return_value=filters), patch.object(
+            server, "search_public_building_indices", return_value=[row]
+        ) as search:
+            output = call(
+                server.search_current_building_indices,
+                query="жилые", subject="Новосибирская область", index_type="building_types",
+            )
+        result = json.loads(output)
+        self.assertEqual(result["items"], [row])
+        self.assertEqual(result["index_type"], "building_types")
+        self.assertEqual(result["authority"], "")
+        self.assertTrue(result["retrieved_at"])
+        search.assert_called_once_with("жилые", filters, "building_types", 10)
+
     def test_ranking_respects_limit_and_direction(self):
         top = call(server.salary_growth_ranking, limit=3)
         self.assertEqual(len(_ranked_lines(top)), 3)

@@ -7,10 +7,16 @@ services:
       - path: .env.fgis_secrets
         required: false
     ports:
-      - "127.0.0.1:${FGISCS_MCP_PUBLISHED_PORT:-8000}:8000"
+      - "127.0.0.1:${FGISCS_MCP_PUBLISHED_PORT:-8002}:8000"
     volumes:
       - fgiscs-data:/app/data/cache
     restart: unless-stopped
+    networks:
+      - fgis-integration
 
 volumes:
   fgiscs-data:
+
+networks:
+  fgis-integration:
+    name: aide-fgis-integration

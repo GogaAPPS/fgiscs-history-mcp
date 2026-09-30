@@ -12,8 +12,9 @@ case "$APP_ENV" in
   *) echo "APP_ENV must be preproduction or production" >&2; exit 1 ;;
 esac
 
-"$KUBECTL" create namespace "$NAMESPACE" --dry-run=client -o yaml | "$KUBECTL" apply -f -
-"$KUBECTL" -n "$NAMESPACE" apply -f k8s/pvc.yaml -f k8s/service.yaml
+# Namespace and persistent storage are provisioned separately by a cluster
+# administrator. The deployer service account only manages app runtime resources.
+"$KUBECTL" -n "$NAMESPACE" apply -f k8s/service.yaml
 
 python3 - "$APP_ENV" "$LOG_LEVEL" k8s/configmap.yaml <<'PY' | "$KUBECTL" -n "$NAMESPACE" apply -f -
 import json
